@@ -82,6 +82,12 @@ class DeviceSnapshot:
     enabled: bool
     battery_level: int
     raw: Device  # full underlying device — use for fields not yet in snapshot
+    #: Whether any device-originated data has reached ``raw`` yet.  False means every
+    #: field below is the model's construction default, which is not the same fact as
+    #: the device reporting those values — ``report_data.dev.sys_status`` defaults to 0
+    #: (``MODE_NOT_ACTIVE``) and ``battery_val`` to 0, so a consumer that cannot tell the
+    #: two apart records "not active, 0%" for a device it has simply not heard from.
+    has_reported: bool = False
 
 
 @dataclass(frozen=True)
@@ -132,6 +138,7 @@ class DeviceStateMachine:
         """Initialise the state machine with a device ID and initial device."""
         self._device_id = device_id
         self._sequence = 0
+        self._has_reported = False
         self._current = self._make_snapshot(initial, DeviceAvailability())
 
     @property
@@ -139,8 +146,19 @@ class DeviceStateMachine:
         """The most recent immutable state snapshot."""
         return self._current
 
+    def mark_reported(self) -> None:
+        """Latch that the model now carries device-originated data.
+
+        Called by ``DeviceHandle`` from every path that applies device content (protobuf
+        frames, thing/properties, Mammotion property pushes), never from one that only
+        applies connectivity or availability — a ``thing/status`` says the device is
+        reachable, not what it is doing.
+        """
+        self._has_reported = True
+
     def restore(self, device: Device) -> None:
         """Replace current state with a restored device (e.g. from HA storage)."""
+        self._has_reported = True
         self._current = self._make_snapshot(device, DeviceAvailability())
 
     def apply(
@@ -187,6 +205,7 @@ class DeviceStateMachine:
             enabled=device.enabled,
             battery_level=battery,
             raw=device,
+            has_reported=self._has_reported,
         )
 
     def _diff(self, old: DeviceSnapshot, new: DeviceSnapshot) -> frozenset[str]:

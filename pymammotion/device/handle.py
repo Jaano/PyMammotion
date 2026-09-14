@@ -658,6 +658,7 @@ class DeviceHandle:
         # 5. Update state machine and emit if anything in the model changed.
         # _diff now walks `raw`, so deep-field mutations (e.g.
         # report_data.dev.sys_status) correctly produce a non-empty `changed`.
+        self.state_machine.mark_reported()
         snapshot, changed = self.state_machine.apply(updated_device, self._availability)
         if changed and not self._stopping:
             await self._state_changed_bus.emit(snapshot)
@@ -735,6 +736,7 @@ class DeviceHandle:
                 self.update_availability(cloud_transport, self._availability.mqtt, mqtt_reported_offline=False)
 
         updated = self._reducer.apply_mammotion_properties(self.state_machine.current.raw, properties)
+        self.state_machine.mark_reported()
         snapshot, _ = self.state_machine.apply(updated, self._availability)
 
         if not self._stopping:
@@ -765,6 +767,7 @@ class DeviceHandle:
                     self.update_availability(cloud_transport, self._availability.mqtt, mqtt_reported_offline=False)
 
             updated = dataclasses.replace(self.state_machine.current.raw, device_event=event)
+            self.state_machine.mark_reported()
             snapshot, _ = self.state_machine.apply(updated, self._availability)
             if not self._stopping:
                 await self._state_changed_bus.emit(snapshot)
@@ -788,6 +791,7 @@ class DeviceHandle:
 
         # Always persist the raw envelope so subscribers can inspect it.
         updated = dataclasses.replace(device_with_props, mqtt_properties=properties)
+        self.state_machine.mark_reported()
         snapshot, _ = self.state_machine.apply(updated, self._availability)
         if not self._stopping:
             await self._state_changed_bus.emit(snapshot)

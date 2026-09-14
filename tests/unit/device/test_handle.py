@@ -2027,3 +2027,62 @@ async def test_start_report_stream_logs_reason_when_saga_active(caplog: pytest.L
         await handle.start_report_stream()
 
     assert any("saga active" in r.getMessage() for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# has_reported — "the model holds device data" vs "the model is still defaults"
+# ---------------------------------------------------------------------------
+
+
+def _thing_status(*, online: bool) -> object:
+    from pymammotion.data.mqtt.status import MammotionStatusMessage
+
+    return MammotionStatusMessage(
+        action="online" if online else "offline",
+        product_key="pk",
+        device_name="Mower One",
+        iot_id="iot1",
+        gmt_create=1779395099943,
+    ).to_thing_status()
+
+
+async def test_a_handle_that_has_heard_nothing_reports_has_reported_false() -> None:
+    """A fresh model's report_data.dev.sys_status is 0 — MODE_NOT_ACTIVE — and battery_val 0,
+    which a consumer cannot tell from readings unless the snapshot says the model is untouched."""
+    from pymammotion.data.model.device import MowingDevice
+
+    handle = DeviceHandle(device_id="dev1", device_name="Mower One", initial_device=MowingDevice())
+
+    assert handle.snapshot.has_reported is False
+    assert handle.snapshot.raw.report_data.dev.sys_status == 0
+    assert handle.snapshot.battery_level == 0
+
+
+async def test_thing_status_alone_does_not_make_a_default_model_look_reported() -> None:
+    """A thing/status says the device is reachable, not what it is doing. It emits a snapshot
+    built from whatever the model already holds, so on an untouched model it must stay
+    has_reported=False — the tick that tore mow spans and closed live faults."""
+    from pymammotion.data.model.device import MowingDevice
+
+    handle = DeviceHandle(device_id="dev1", device_name="Mower One", initial_device=MowingDevice())
+
+    await handle.on_status_message(_thing_status(online=True))
+
+    assert handle.snapshot.has_reported is False
+    assert handle.snapshot.raw.status_properties is not None
+
+
+async def test_a_report_frame_latches_has_reported() -> None:
+    """The first device-originated frame is what makes the model's values readings."""
+    from pymammotion.data.model.device import MowingDevice
+    from pymammotion.proto import DevNet, LubaMsg, MsgDevice
+
+    handle = DeviceHandle(device_id="dev1", device_name="Mower One", initial_device=MowingDevice())
+    msg = LubaMsg(sender=MsgDevice.DEV_MOBILEAPP, rcver=MsgDevice.DEV_MAINCTL, net=DevNet())
+
+    await handle.on_raw_message(bytes(msg))
+
+    assert handle.snapshot.has_reported is True
+    # And it stays latched across a later connectivity-only message.
+    await handle.on_status_message(_thing_status(online=True))
+    assert handle.snapshot.has_reported is True

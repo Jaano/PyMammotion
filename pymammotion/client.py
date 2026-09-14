@@ -717,6 +717,7 @@ class MammotionClient:
                     current = handle.snapshot.raw
                     if isinstance(current, RTKBaseStationDevice):
                         updated = dataclasses.replace(current, lora_version=rtk.lora)
+                        handle.state_machine.mark_reported()
                         snapshot, _ = handle.state_machine.apply(updated, handle.availability)
                         await handle.emit_state_changed(snapshot)
                     break
@@ -770,6 +771,7 @@ class MammotionClient:
             if device_version := data.deviceVersion:  # type: ignore
                 updated = dataclasses.replace(updated, device_version=device_version.value)
             if updated is not current:
+                handle.state_machine.mark_reported()
                 snapshot, _ = handle.state_machine.apply(updated, handle.availability)
                 await handle.emit_state_changed(snapshot)
         except Exception:  # noqa: BLE001
