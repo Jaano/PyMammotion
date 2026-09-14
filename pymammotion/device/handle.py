@@ -1324,7 +1324,14 @@ class DeviceHandle:
         * The stop callback skips RPT_STOP if BLE is still streaming so the BLE
           polling loop is never interrupted mid-run.
         """
-        if self.device_mode() != _DeviceMode.ACTIVE:
+        mode = self.device_mode()
+        if mode != _DeviceMode.ACTIVE:
+            _logger.debug(
+                "start_report_stream [%s]: device_mode=%s (not ACTIVE) — one-shot poll only,"
+                " no continuous stream armed",
+                self.device_name,
+                mode.value,
+            )
             await self.request_report_snapshot()
             return
 
@@ -1334,9 +1341,22 @@ class DeviceHandle:
             self._report_stream_timer.cancel()
             self._report_stream_timer = None
 
-        if not self._ble_stream_active:
+        if self._ble_stream_active:
+            _logger.debug(
+                "start_report_stream [%s]: BLE stream already active — renewing stop timer only,"
+                " no MQTT send",
+                self.device_name,
+            )
+        else:
+            if self.queue.is_saga_active:
+                _logger.debug(
+                    "start_report_stream [%s]: saga active — %s send will be dropped"
+                    " (skip_if_saga_active)",
+                    self.device_name,
+                    "RPT_KEEP" if already_streaming else "RPT_START",
+                )
             if already_streaming:
-                await self._send_report_stream_keep()
+                await self._send_report_stream_keep(duration_ms)
             else:
                 await self._send_report_stream_start(duration_ms)
 
@@ -1430,11 +1450,22 @@ class DeviceHandle:
 
         await self.queue.enqueue(_send, priority=Priority.BACKGROUND, skip_if_saga_active=True)
 
-    async def _send_report_stream_keep(self) -> None:
-        """Enqueue RPT_KEEP to refresh an already-active continuous stream."""
+    async def _send_report_stream_keep(self, duration_ms: int) -> None:
+        """Enqueue RPT_KEEP to refresh an already-active continuous stream.
+
+        Must carry the same ``timeout``/``period``/``no_change_period`` as the
+        ``RPT_START`` it renews (see ``_send_report_stream_start``) — ``timeout`` is the
+        device-side lifetime of the subscription, so a KEEP built from the builder's
+        defaults (10 000/1 000/1 000 ms) replaces the held window with a 10 s one instead
+        of extending it, silently shortening every continuous stream to 10 s after its
+        first renewal.
+        """
         cmd_bytes = self.commands.request_iot_sys(
             rpt_act=RptAct.RPT_KEEP,
             rpt_info_type=_REPORT_CHANNELS,
+            timeout=duration_ms,
+            period=3000,
+            no_change_period=4000,
             count=0,
         )
 

@@ -1899,3 +1899,131 @@ async def test_send_marked_passes_firmware_version_to_is_send_blocked() -> None:
     await handle._send_marked(mqtt, b"\x01")  # noqa: SLF001
 
     mqtt.is_send_blocked.assert_called_once_with(handle.firmware_version)
+
+
+# ---------------------------------------------------------------------------
+# I.66: RPT_KEEP must renew the same window as the RPT_START it follows
+# ---------------------------------------------------------------------------
+
+
+async def _run_enqueued_immediately(handle: DeviceHandle) -> None:
+    """Replace handle.queue.enqueue with one that runs the work inline.
+
+    _send_report_stream_start/_keep build their command bytes eagerly and only defer
+    the verified send via the real queue's background processor — starting that
+    processor just to observe the bytes it was given would make these tests
+    scheduling-dependent for no reason, since scheduling isn't what they check.
+    """
+
+    async def _enqueue(work: object, **_kwargs: object) -> None:
+        await work()  # type: ignore[operator]
+
+    handle.queue.enqueue = _enqueue  # type: ignore[method-assign]
+
+
+async def test_report_stream_keep_renews_same_window_as_start() -> None:
+    """_send_report_stream_keep must carry the same timeout/period/no_change_period as
+    _send_report_stream_start — the request_iot_sys defaults it used to fall back to
+    (timeout=10_000/period=1_000/no_change_period=1_000) silently replace a held
+    five-minute window with a ten-second one on every renewal (I.66)."""
+    handle = make_handle()
+    await _run_enqueued_immediately(handle)
+
+    async def _fake_verified(cmd_bytes: bytes, transport_send: object, sync_fn: object = None) -> bool:
+        return True
+
+    with patch.object(handle, "_send_rpt_start_verified", side_effect=_fake_verified) as verified:
+        await handle._send_report_stream_start(300_000)  # noqa: SLF001
+        await handle._send_report_stream_keep(300_000)  # noqa: SLF001
+
+    start_bytes = verified.call_args_list[0].args[0]
+    keep_bytes = verified.call_args_list[1].args[0]
+    start_cfg = RealLubaMsg().parse(start_bytes).sys.todev_report_cfg
+    keep_cfg = RealLubaMsg().parse(keep_bytes).sys.todev_report_cfg
+
+    assert (keep_cfg.timeout, keep_cfg.period, keep_cfg.no_change_period) == (
+        start_cfg.timeout,
+        start_cfg.period,
+        start_cfg.no_change_period,
+    )
+    assert keep_cfg.timeout == 300_000
+
+
+async def test_report_stream_keep_uses_callers_duration() -> None:
+    """A KEEP for a non-default window renews that window, not a hardcoded one."""
+    handle = make_handle()
+    await _run_enqueued_immediately(handle)
+
+    async def _fake_verified(cmd_bytes: bytes, transport_send: object, sync_fn: object = None) -> bool:
+        return True
+
+    with patch.object(handle, "_send_rpt_start_verified", side_effect=_fake_verified) as verified:
+        await handle._send_report_stream_keep(60_000)  # noqa: SLF001
+
+    keep_cfg = RealLubaMsg().parse(verified.call_args.args[0]).sys.todev_report_cfg
+    assert keep_cfg.timeout == 60_000
+
+
+# ---------------------------------------------------------------------------
+# I.67: a start_report_stream tick that sends nothing must say why
+# ---------------------------------------------------------------------------
+
+
+async def test_start_report_stream_logs_reason_when_not_active(caplog: pytest.LogCaptureFixture) -> None:
+    """A device_mode() other than ACTIVE falls through to a one-shot poll instead of holding
+    a continuous stream — that branch must be observable, not just its downstream debounce."""
+    handle = make_handle()  # make_device() leaves sys_status="idle" — not in MOWING_ACTIVE_MODES
+    handle.request_report_snapshot = AsyncMock()  # type: ignore[method-assign]
+
+    with caplog.at_level("DEBUG"):
+        await handle.start_report_stream()
+
+    handle.request_report_snapshot.assert_awaited_once()
+    assert any("not ACTIVE" in r.getMessage() for r in caplog.records)
+
+
+async def test_start_report_stream_logs_reason_when_ble_already_streaming(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """When the BLE loop already holds a continuous stream, start_report_stream renews only
+    its own stop timer and must say so — the caller has no other way to tell this tick from
+    one that actually reached the wire."""
+    from pymammotion.utility.constant import WorkMode
+
+    handle = make_handle()
+    handle.state_machine.current.raw.report_data.dev.sys_status = WorkMode.MODE_WORKING.value
+    handle._ble_stream_active = True  # noqa: SLF001
+    await _run_enqueued_immediately(handle)
+
+    with (
+        patch.object(handle, "_send_report_stream_start") as start_mock,
+        patch.object(handle, "_send_report_stream_keep") as keep_mock,
+        caplog.at_level("DEBUG"),
+    ):
+        await handle.start_report_stream()
+
+    start_mock.assert_not_called()
+    keep_mock.assert_not_called()
+    assert any("BLE stream already active" in r.getMessage() for r in caplog.records)
+
+
+async def test_start_report_stream_logs_reason_when_saga_active(caplog: pytest.LogCaptureFixture) -> None:
+    """A saga-active tick still enqueues (skip_if_saga_active drops it inside the queue), but
+    that drop must be attributable from the log rather than looking identical to a real send."""
+    from pymammotion.utility.constant import WorkMode
+
+    handle = make_handle()
+    handle.state_machine.current.raw.report_data.dev.sys_status = WorkMode.MODE_WORKING.value
+    await _run_enqueued_immediately(handle)
+
+    from unittest.mock import PropertyMock
+
+    with (
+        patch.object(type(handle.queue), "is_saga_active", new_callable=PropertyMock) as is_saga_active,
+        patch.object(handle, "_send_rpt_start_verified", new=AsyncMock(return_value=True)),
+        caplog.at_level("DEBUG"),
+    ):
+        is_saga_active.return_value = True
+        await handle.start_report_stream()
+
+    assert any("saga active" in r.getMessage() for r in caplog.records)
