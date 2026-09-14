@@ -49,12 +49,18 @@ def _make_handle() -> MagicMock:
     handle.device_mode = MagicMock(return_value=_DeviceMode.ACTIVE)
     handle.in_no_request_mode = MagicMock(return_value=False)
 
-    # Async hooks the loop calls
-    handle._send_report_stream_keep = AsyncMock()
+    # Async hooks the loop calls. RPT_KEEP goes through _enqueue_ble_stream_command (BLE-pinned,
+    # send_heartbeat) rather than the MQTT-oriented _send_report_stream_keep — an AsyncMock here
+    # accepts any call shape, so it verifies which *branch* fires but not that the real method
+    # would accept the call; test_active_stream_keep_call_site_matches_real_handle covers that.
     handle._enqueue_ble_stream_command = AsyncMock()
     handle._send_one_shot_report = AsyncMock()
 
     return handle
+
+
+def _calls_for(handle: MagicMock, act: RptAct) -> list:
+    return [c for c in handle._enqueue_ble_stream_command.await_args_list if c.args and c.args[0] == act]
 
 
 async def _run_one_tick(handle: MagicMock) -> None:
@@ -83,7 +89,7 @@ async def test_first_iteration_sends_rpt_start() -> None:
     await _run_one_tick(handle)
 
     handle._enqueue_ble_stream_command.assert_any_await(RptAct.RPT_START, count=0)
-    handle._send_report_stream_keep.assert_not_awaited()
+    assert _calls_for(handle, RptAct.RPT_KEEP) == []
 
 
 @pytest.mark.asyncio
@@ -96,12 +102,8 @@ async def test_active_stream_sends_rpt_keep_when_data_flowing() -> None:
 
     await _run_one_tick(handle)
 
-    handle._send_report_stream_keep.assert_awaited()
-    rpt_stop_calls = [
-        c for c in handle._enqueue_ble_stream_command.await_args_list
-        if c.args and c.args[0] == RptAct.RPT_STOP
-    ]
-    assert rpt_stop_calls == [], "RPT_STOP should not fire on a healthy stream"
+    handle._enqueue_ble_stream_command.assert_any_await(RptAct.RPT_KEEP, count=0)
+    assert _calls_for(handle, RptAct.RPT_STOP) == [], "RPT_STOP should not fire on a healthy stream"
 
 
 @pytest.mark.asyncio
@@ -119,18 +121,10 @@ async def test_stale_stream_bounces_with_stop_then_fresh_start() -> None:
 
     await _run_one_tick(handle)
 
-    rpt_stop_calls = [
-        c for c in handle._enqueue_ble_stream_command.await_args_list
-        if c.args and c.args[0] == RptAct.RPT_STOP
-    ]
-    rpt_start_calls = [
-        c for c in handle._enqueue_ble_stream_command.await_args_list
-        if c.args and c.args[0] == RptAct.RPT_START
-    ]
-    assert len(rpt_stop_calls) == 1, "stale stream must trigger exactly one RPT_STOP"
-    assert len(rpt_start_calls) == 1, "stale stream must trigger a fresh RPT_START"
+    assert len(_calls_for(handle, RptAct.RPT_STOP)) == 1, "stale stream must trigger exactly one RPT_STOP"
+    assert len(_calls_for(handle, RptAct.RPT_START)) == 1, "stale stream must trigger a fresh RPT_START"
     # And critically — no RPT_KEEP fired this tick (we bounced instead)
-    handle._send_report_stream_keep.assert_not_awaited()
+    assert _calls_for(handle, RptAct.RPT_KEEP) == []
 
 
 @pytest.mark.asyncio
@@ -144,12 +138,8 @@ async def test_stale_check_skipped_before_first_report() -> None:
 
     await _run_one_tick(handle)
 
-    handle._send_report_stream_keep.assert_awaited()
-    rpt_stop_calls = [
-        c for c in handle._enqueue_ble_stream_command.await_args_list
-        if c.args and c.args[0] == RptAct.RPT_STOP
-    ]
-    assert rpt_stop_calls == [], "must not bounce on a never-received-report boot"
+    handle._enqueue_ble_stream_command.assert_any_await(RptAct.RPT_KEEP, count=0)
+    assert _calls_for(handle, RptAct.RPT_STOP) == [], "must not bounce on a never-received-report boot"
 
 
 @pytest.mark.asyncio
@@ -171,3 +161,37 @@ async def test_stale_check_tolerates_stop_failure() -> None:
     assert handle._enqueue_ble_stream_command.await_count >= 2
     second_call = handle._enqueue_ble_stream_command.await_args_list[1]
     assert second_call.args[0] == RptAct.RPT_START
+
+
+@pytest.mark.asyncio
+async def test_active_stream_keep_call_site_matches_real_handle() -> None:
+    """Regression: every test above mocks the whole handle, so an AsyncMock() accepts any call
+    shape and a call-site/signature mismatch (this file's own bug, once — ble_loop.py called
+    ``handle._send_report_stream_keep()`` with no args after that method's signature gained a
+    required ``duration_ms``) raises nowhere in this file. Drive the exact call the "stream
+    already active" branch makes against a *real* DeviceHandle instead, so a future signature
+    change on either side fails here rather than only in production."""
+    from pymammotion.device.handle import DeviceHandle
+
+    ble = MagicMock()
+    ble.transport_type = TransportType.BLE
+    ble.is_connected = True
+    ble.send_heartbeat = AsyncMock()
+    device = MagicMock()
+    device.report_data.dev.sys_status = "idle"
+    handle = DeviceHandle(device_id="dev1", device_name="Mower One", initial_device=device, ble_transport=ble)
+
+    async def _run_enqueued_immediately(work: object, **_kwargs: object) -> None:
+        await work()  # type: ignore[operator]
+
+    handle.queue.enqueue = _run_enqueued_immediately  # type: ignore[method-assign]
+
+    await handle._enqueue_ble_stream_command(RptAct.RPT_KEEP, count=0)  # noqa: SLF001
+
+    ble.send_heartbeat.assert_awaited_once()
+    sent_bytes = ble.send_heartbeat.await_args.args[0]
+    from pymammotion.proto import LubaMsg
+
+    cfg = LubaMsg().parse(sent_bytes).sys.todev_report_cfg
+    assert cfg.act == RptAct.RPT_KEEP
+    assert cfg.count == 0

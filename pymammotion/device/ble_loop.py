@@ -213,8 +213,13 @@ async def ble_polling_loop(handle: DeviceHandle) -> None:
                 try:
                     if handle.ble_stream_active:
                         # Stream already running — send RPT_KEEP to renew the
-                        # device-side subscription before the 10 s timeout.
-                        await handle._send_report_stream_keep()  # noqa: SLF001
+                        # device-side subscription before the 10 s timeout. Routed through
+                        # _enqueue_ble_stream_command (not _send_report_stream_keep, which is
+                        # MQTT-oriented: it resolves active_transport() rather than pinning to
+                        # BLE, and sends via the queue rather than send_heartbeat, costing cloud
+                        # quota and resetting the BLE idle-disconnect timer) — same helper this
+                        # branch's own RPT_START already uses below.
+                        await handle._enqueue_ble_stream_command(RptAct.RPT_KEEP, count=0)  # noqa: SLF001
                     else:
                         # Stream not yet active — establish it with RPT_START.
                         # _enqueue_ble_stream_command verifies via send_and_wait
