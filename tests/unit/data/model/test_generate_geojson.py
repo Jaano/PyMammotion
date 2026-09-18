@@ -277,7 +277,7 @@ def test_dump_type_emits_a_point_geojson_feature() -> None:
     )
 
     hash_list, dump_hash = _hash_list_with_dump_type()
-    hash_list.generate_geojson(rtk, dock)
+    apply_area_geojson(hash_list, rtk, dock)
     result = hash_list.generated_geojson
 
     dump_features = [f for f in result["features"] if f["properties"].get("type_name") == "dump"]
@@ -299,7 +299,7 @@ def test_dump_feature_gets_meaningful_name_and_description() -> None:
     )
 
     hash_list, _dump_hash = _hash_list_with_dump_type()
-    hash_list.generate_geojson(rtk, dock)
+    apply_area_geojson(hash_list, rtk, dock)
     result = hash_list.generated_geojson
 
     feature = next(f for f in result["features"] if f["properties"].get("type_name") == "dump")

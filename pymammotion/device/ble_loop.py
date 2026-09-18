@@ -221,7 +221,7 @@ async def ble_polling_loop(handle: LoopHost) -> None:
                         await handle.send_report_stream_keep()
                     else:
                         # Stream not yet active — establish it with RPT_START.
-                        # _enqueue_ble_stream_command verifies via send_and_wait
+                        # enqueue_ble_stream_command verifies via send_and_wait
                         # and sets ble_stream_active itself on success.  If
                         # verification fails the flag stays False and this
                         # branch retries on the next tick.

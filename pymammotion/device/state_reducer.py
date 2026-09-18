@@ -532,7 +532,7 @@ class MowerStateReducer(StateReducer):
         """
         if self._is_saga_active() or not device.map.mow_path_needs_regeneration(device.location.RTK):
             return
-        device.map.generate_mowing_geojson(device.location.RTK)
+        apply_mowing_geojson(device.map, device.location.RTK)
 
     def _update_sys_data(self, device: MowingDevice, message: LubaMsg) -> None:
         """Update system data fields on *device* in-place."""

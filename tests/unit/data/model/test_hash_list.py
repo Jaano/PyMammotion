@@ -29,6 +29,7 @@ from pymammotion.data.model.hash_list import (
     NavNameTime,
     PathType,
 )
+from pymammotion.data.model.generate_geojson import apply_mowing_geojson
 from pymammotion.data.model.location import LocationPoint
 
 # A synthetic RTK origin in the radians the wire carries, built from round degrees so it is
@@ -875,7 +876,7 @@ def test_cached_frames_with_no_geojson_are_outstanding_work() -> None:
 
 def test_nothing_is_outstanding_once_it_has_been_built() -> None:
     hash_list = _with_cover_path()
-    hash_list.generate_mowing_geojson(_RTK)
+    apply_mowing_geojson(hash_list, _RTK)
 
     assert not hash_list.mow_path_needs_regeneration(_RTK)
 
@@ -886,7 +887,7 @@ def test_a_path_with_no_origin_yet_is_not_built_and_stays_outstanding() -> None:
     origin arrives, which is what the caller then acts on."""
     hash_list = _with_cover_path()
 
-    hash_list.generate_mowing_geojson(LocationPoint())
+    apply_mowing_geojson(hash_list, LocationPoint())
 
     assert hash_list.generated_mow_path_geojson == {}
     assert not hash_list.mow_path_needs_regeneration(LocationPoint())  # nothing to build against
@@ -898,7 +899,7 @@ def test_a_new_route_makes_the_built_path_stale() -> None:
     in the comparison an unconverted second job would look already-done, since the origin it
     would be built against is the same one."""
     hash_list = _with_cover_path(path_hash=1111)
-    hash_list.generate_mowing_geojson(_RTK)
+    apply_mowing_geojson(hash_list, _RTK)
 
     hash_list.current_mow_path = {}
     hash_list.update_mow_path(
@@ -917,7 +918,7 @@ def test_a_moved_origin_makes_the_built_path_stale() -> None:
     """Same reason the map geometry rebuilds on a changed origin: every coordinate in the stored
     path is an ENU offset projected through it."""
     hash_list = _with_cover_path()
-    hash_list.generate_mowing_geojson(_RTK)
+    apply_mowing_geojson(hash_list, _RTK)
 
     moved = LocationPoint(latitude=_RTK.latitude + 4.7e-6, longitude=_RTK.longitude)
 

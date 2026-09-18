@@ -21,6 +21,7 @@ import asyncio
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 
 from pymammotion.device.ble_loop import (
     _BLE_STREAM_STALE_THRESHOLD,
@@ -28,6 +29,7 @@ from pymammotion.device.ble_loop import (
 )
 from pymammotion.device.modes import _DeviceMode
 from pymammotion.proto import RptAct
+from pymammotion.transport.base import TransportType
 
 
 def _make_loop_host() -> MagicMock:
@@ -55,7 +57,7 @@ def _make_loop_host() -> MagicMock:
 
 
 def _calls_for(handle: MagicMock, act: RptAct) -> list:
-    return [c for c in handle._enqueue_ble_stream_command.await_args_list if c.args and c.args[0] == act]
+    return [c for c in handle.enqueue_ble_stream_command.await_args_list if c.args and c.args[0] == act]
 
 
 async def _run_one_tick(handle: MagicMock) -> None:
@@ -192,7 +194,7 @@ async def test_active_stream_keep_call_site_matches_real_handle() -> None:
 
     handle.queue.enqueue = _run_enqueued_immediately  # type: ignore[method-assign]
 
-    await handle._enqueue_ble_stream_command(RptAct.RPT_KEEP, count=0)  # noqa: SLF001
+    await handle.enqueue_ble_stream_command(RptAct.RPT_KEEP, count=0)
 
     ble.send_heartbeat.assert_awaited_once()
     sent_bytes = ble.send_heartbeat.await_args.args[0]
