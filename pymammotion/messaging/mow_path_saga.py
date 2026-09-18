@@ -56,6 +56,12 @@ class MowPathSaga(Saga):
     #: and with ``max_attempts = 1`` there is no retry to cover for it.
     step_timeout = 3.0
 
+    #: Re-sends of a batch request whose first frame never arrived within ``step_timeout``.
+    #: The APK does the same on the same watchdog (``HashDataManager`` fires ``handlerType_12333``
+    #: every 3 s and re-issues, up to 10 times); a request sent as a job starts is answered in
+    #: ~5 s rather than the usual ~0.5, and some are never answered at all.
+    first_frame_attempts = 4
+
     def __init__(
         self,
         command_builder: Any,
@@ -273,9 +279,29 @@ class MowPathSaga(Saga):
                 # is never the one that trips the guard.
                 prev_missing = _missing_frame_count()
                 no_progress = 0
+                attempts_left = self.first_frame_attempts
 
                 while True:
-                    frame_response = await self._next_frame(path_queue, "cover_path_upload")
+                    try:
+                        frame_response = await self._next_frame(path_queue, "cover_path_upload")
+                    except CommandTimeoutError:
+                        # Nothing yet. Re-ask rather than abandon the run: the device answers a
+                        # request made as a job starts in ~5 s, and drops one outright now and
+                        # then. A re-send carries a fresh transaction id, so late frames from the
+                        # earlier attempt are dropped as residual below.
+                        attempts_left -= 1
+                        if attempts_left <= 0:
+                            raise
+                        transaction_id = int(time.time() * 1000)
+                        current_run_tx_ids.add(transaction_id)
+                        _logger.debug(
+                            "MowPathSaga: no first frame for batch %d/%d — re-asking, transaction_id=%d",
+                            batch_idx + 1,
+                            len(hash_batches),
+                            transaction_id,
+                        )
+                        await self._send_command(self._command_builder.get_line_info_list(batch_hashes, transaction_id))
+                        continue
 
                     path_frame = self.extract_nav_frame(frame_response, "cover_path_upload")
                     assert path_frame is not None  # noqa: S101 — the collector already filtered on this field

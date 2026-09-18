@@ -1900,3 +1900,68 @@ async def test_default_session_skips_the_ble_only_placeholder() -> None:
 
     assert client._account_registry.all_sessions[0].account_id == BLE_ONLY_ACCOUNT
     assert client._get_default_session() is cloud
+
+
+# ---------------------------------------------------------------------------
+# check_and_get_mow_path — the app's own cover-path fetch
+# ---------------------------------------------------------------------------
+
+
+def _mower_with_route(path_hash: int = 7777, cached: bool = False) -> MagicMock:
+    """A mower reporting a route, with or without its cover path already cached."""
+    device = make_mowing_device()
+    device.report_data.dev.sys_status = 0
+    device.report_data.work.path_hash = path_hash
+    device.report_data.locations = [MagicMock(bol_hash=1234)]
+    device.map.computed_bol_hash = 1234
+    device.map.has_mow_path_for_hash.return_value = cached
+    return device
+
+
+async def _registered(client: MammotionClient, device: MagicMock) -> DeviceHandle:
+    handle = DeviceHandle(device_id="dev1", device_name="Luba-Test", initial_device=device)
+    handle.send_raw = AsyncMock()
+    await client._device_registry.register(handle)  # noqa: SLF001
+    return handle
+
+
+async def test_check_and_get_mow_path_reads_the_route_then_asks_for_the_path() -> None:
+    """Route configuration read first: without it a fresh session has nothing to ask with."""
+    client = MammotionClient()
+    handle = await _registered(client, _mower_with_route())
+    client.start_mow_path_saga = AsyncMock()
+
+    assert await client.check_and_get_mow_path("Luba-Test") is True
+
+    handle.send_raw.assert_awaited_once()
+    assert client.start_mow_path_saga.await_args.kwargs["skip_planning"] is True
+
+
+async def test_check_and_get_mow_path_does_nothing_when_the_path_is_already_cached() -> None:
+    """Called on every map sync, so the common answer must cost nothing."""
+    client = MammotionClient()
+    handle = await _registered(client, _mower_with_route(cached=True))
+    client.start_mow_path_saga = AsyncMock()
+
+    assert await client.check_and_get_mow_path("Luba-Test") is False
+
+    handle.send_raw.assert_not_awaited()
+    client.start_mow_path_saga.assert_not_awaited()
+
+
+async def test_check_and_get_mow_path_does_nothing_for_an_idle_device() -> None:
+    """No route to ask for — and the cached path is left alone, never invalidated."""
+    client = MammotionClient()
+    device = _mower_with_route(path_hash=0)
+    handle = await _registered(client, device)
+    client.start_mow_path_saga = AsyncMock()
+
+    assert await client.check_and_get_mow_path("Luba-Test") is False
+
+    handle.send_raw.assert_not_awaited()
+    device.map.invalidate_mow_path.assert_not_called()
+
+
+async def test_check_and_get_mow_path_is_a_no_op_for_an_unknown_device() -> None:
+    client = MammotionClient()
+    assert await client.check_and_get_mow_path("not-registered") is False

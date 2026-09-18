@@ -2303,27 +2303,37 @@ class MammotionClient:
 
         await handle.enqueue_saga(saga, on_complete=_on_complete)
 
-    async def check_and_get_mow_path(self, device_name: str) -> None:
-        """Fetch the cover path for the current route unless a valid one is already cached."""
-        if handle := self._device_registry.get_by_name(device_name):
-            device = cast(MowerDevice, handle.snapshot.raw)
-            work = device.report_data.work
-            if device.map.current_mow_path and device.map.has_mow_path_for_hash(work.path_hash):
-                return  # Cache is valid for the current route
-            if device.map.current_mow_path:
-                device.map.invalidate_mow_path(0)
-            if not _should_fetch_mow_path(device, handle, work.path_hash):
-                return
-            _logger.debug(
-                "Device %s path_hash=%d — auto-fetching cover path",
-                device_name,
-                work.path_hash,
-            )
-            try:
-                current_work = GenerateRouteInformation.from_current_task_settings(device.work)
-                await self.start_mow_path_saga(device_name, zone_hashs=[], route_info=current_work, skip_planning=True)
-            except Exception:  # noqa: BLE001
-                _logger.warning("Auto-trigger MowPathSaga failed for %s", device_name, exc_info=True)
+    async def check_and_get_mow_path(self, device_name: str) -> bool:
+        """Fetch the cover path for the current route unless a valid one is already cached.
+
+        The app's sequence: read the route configuration, then request the path by hash.  The
+        read matters on a session that has not seen a job start, where ``device.work`` is empty
+        and there is nothing to ask with.  Returns True when a fetch was started.
+
+        A cached path is never dropped here.  Discarding it before the replacement arrives blanks
+        the layer drawing it, and the test for "stale" would be ``work.path_hash``, which reads
+        ``1`` on every idle device rather than naming a route.
+        """
+        handle = self._device_registry.get_by_name(device_name)
+        if handle is None:
+            return False
+        device = cast(MowerDevice, handle.snapshot.raw)
+        work = device.report_data.work
+        if device.map.has_mow_path_for_hash(work.path_hash):
+            return False  # Cache is valid for the current route
+        if not _should_fetch_mow_path(device, handle, work.path_hash):
+            return False
+
+        # The reducer folds the reply into `device.work`, which the route info is built from.
+        await handle.send_raw(handle.commands.query_generate_route_information())
+        try:
+            route_info = GenerateRouteInformation.from_current_task_settings(device.work)
+        except Exception:  # noqa: BLE001 - a malformed/empty task cannot be turned into a request
+            _logger.debug("check_and_get_mow_path '%s': no usable route configuration yet", device_name)
+            return False
+        _logger.debug("Device %s path_hash=%d — fetching cover path", device_name, work.path_hash)
+        await self.start_mow_path_saga(device_name, zone_hashs=[], route_info=route_info, skip_planning=True)
+        return True
 
     async def start_mow_path_saga(
         self,
