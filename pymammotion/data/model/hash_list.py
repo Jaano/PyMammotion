@@ -412,7 +412,21 @@ class HashList(DataClassORJSONMixin):
     current_mow_path: dict[int, dict[int, MowPath]] = field(default_factory=dict)
     generated_geojson: dict[str, Any] = field(default_factory=dict)
     geojson_yaw: float = 0.0  # RTK yaw (radians) used when generated_geojson was last built
+    #: RTK origin (radians) ``generated_geojson`` was last built against.  Every coordinate in it
+    #: is an ENU offset projected through that origin, so a changed origin moves the whole map —
+    #: which ``geojson_needs_regeneration`` has to notice, since nothing else will.
+    geojson_origin_lat: float = 0.0
+    geojson_origin_lon: float = 0.0
     generated_mow_path_geojson: dict[str, Any] = field(default_factory=dict)
+    #: What ``generated_mow_path_geojson`` was last built from and against: the route hash of the
+    #: cached frames, and the RTK origin (radians) and yaw they were projected through.  An origin
+    #: of 0.0 means it has never been built, which is a different state from "built and empty".
+    #: ``mow_path_needs_regeneration`` compares all three — see it for why the cover path needs a
+    #: staleness check of its own rather than being built once when the frames land.
+    mow_path_geojson_hash: int = 0
+    mow_path_geojson_origin_lat: float = 0.0
+    mow_path_geojson_origin_lon: float = 0.0
+    mow_path_geojson_yaw: float = 0.0
     last_ub_path_hash: int = 0
     plans_stale: bool = False
     #: Set once a PlanFetchSaga completes, so an empty ``plan`` can be told apart
@@ -1086,12 +1100,20 @@ class HashList(DataClassORJSONMixin):
         self.line = {h: frames for h, frames in self.line.items() if h == ub_path_hash}
         return ub_path_hash not in self.line
 
-    def geojson_needs_regeneration(self, rtk: LocationPoint, yaw_threshold: float = 0.01) -> bool:
-        """Return True if the stored GeoJSON is absent, has a stale RTK yaw, or has stale map hashes.
+    def geojson_needs_regeneration(
+        self, rtk: LocationPoint, yaw_threshold: float = 0.01, origin_threshold: float = 1e-7
+    ) -> bool:
+        """Return True if the stored GeoJSON is absent, was built against a different RTK origin
+        or yaw, or has stale map hashes.
 
-        A difference larger than *yaw_threshold* radians (~0.6°) means the
-        coordinate rotation used at generation time no longer matches the
-        current RTK heading, so the GeoJSON should be regenerated.
+        The stored GeoJSON is every map coordinate projected out of the device's
+        ENU frame through one origin and one heading.  A difference larger than
+        *yaw_threshold* radians (~0.6°) means the rotation no longer matches the
+        current RTK heading; a difference larger than *origin_threshold* radians
+        (~0.6 m) means the map is anchored somewhere the device no longer says it
+        is.  Either one displaces the whole map, and the origin case is invisible
+        without this check — the hashes are unchanged, so nothing else would ever
+        ask for a rebuild.
 
         Hash staleness is detected by comparing the current
         ``area_root_hashlist`` against the snapshot taken when the GeoJSON was
@@ -1102,6 +1124,11 @@ class HashList(DataClassORJSONMixin):
         if not self.generated_geojson:
             return True
         if abs(rtk.yaw - self.geojson_yaw) > yaw_threshold:
+            return True
+        if (
+            abs(rtk.latitude - self.geojson_origin_lat) > origin_threshold
+            or abs(rtk.longitude - self.geojson_origin_lon) > origin_threshold
+        ):
             return True
         current_hashlist = frozenset(self.area_root_hashlist)
         if not current_hashlist:
@@ -1135,13 +1162,63 @@ class HashList(DataClassORJSONMixin):
             yaw=rtk.yaw,
         )
         self.geojson_yaw = rtk.yaw
-        # Record the hashlist used so the next geojson_needs_regeneration()
-        # can short-circuit when state hasn't changed.
+        # Record the origin and hashlist used so the next geojson_needs_regeneration()
+        # can tell a rebuilt-for-nothing from a map anchored where the device no longer is.
+        self.geojson_origin_lat = rtk.latitude
+        self.geojson_origin_lon = rtk.longitude
         self._geojson_hashlist_snapshot = frozenset(self.area_root_hashlist)
 
+    def _cached_mow_path_hash(self) -> int:
+        """Route hash the cached cover-path frames belong to, or 0 when none are cached."""
+        for frames in self.current_mow_path.values():
+            for mow_path in frames.values():
+                if mow_path.path_packets:
+                    return mow_path.path_packets[0].path_hash
+        return 0
+
+    def mow_path_needs_regeneration(
+        self, rtk: LocationPoint, yaw_threshold: float = 0.01, origin_threshold: float = 1e-7
+    ) -> bool:
+        """Return True if cached cover-path frames exist that ``generated_mow_path_geojson`` does
+        not represent — a different route, a different origin or yaw, or never built at all.
+
+        The conversion at ``cover_path_upload`` is one-shot and conditional: it is skipped while a
+        saga owns the queue, and it can run before the RTK origin has ever been received.  Neither
+        condition retries itself, so without a check like this the frames stay cached as data that
+        never becomes a layer until the next job start pushes a fresh set — the map geometry has
+        had ``geojson_needs_regeneration`` for exactly this reason, and the cover path had nothing.
+
+        Ordered so the steady state is cheap: the common answer is "already built against this
+        origin", which costs a few comparisons and never walks the frames.  ``rtk.latitude == 0.0``
+        is the unset-origin test the rest of this module uses (see ``apply_mow_progress_geojson``)
+        — building against it would anchor the path at null island, which is worse than not
+        building it at all, since nothing downstream can tell that result from a real one.
+        """
+        if not self.current_mow_path or rtk.latitude == 0.0:
+            return False
+        if (
+            self.mow_path_geojson_origin_lat != 0.0
+            and self.mow_path_geojson_hash == self._cached_mow_path_hash()
+            and abs(rtk.latitude - self.mow_path_geojson_origin_lat) <= origin_threshold
+            and abs(rtk.longitude - self.mow_path_geojson_origin_lon) <= origin_threshold
+            and abs(rtk.yaw - self.mow_path_geojson_yaw) <= yaw_threshold
+        ):
+            return False
+        return not self.find_missing_mow_path_frames()
+
     def generate_mowing_geojson(self, rtk: LocationPoint) -> Any:
-        """Rebuild ``generated_mow_path_geojson`` from the cached mow-path frames."""
+        """Rebuild ``generated_mow_path_geojson`` from the cached mow-path frames.
+
+        No-op while the RTK origin is unset (``latitude == 0.0``), like
+        ``apply_mow_progress_geojson``: the projection would anchor every coordinate at null
+        island, and a previously-good path is better kept than replaced with that.
+        ``mow_path_needs_regeneration`` then still reports the work as outstanding, so the next
+        tick after the origin arrives builds it.
+        """
         from pymammotion.data.model.generate_geojson import GeojsonGenerator
+
+        if rtk.latitude == 0.0:
+            return self.generated_mow_path_geojson
 
         coordinator_converter = CoordinateConverter(rtk.latitude, rtk.longitude)
         rtk_real_loc = coordinator_converter.enu_to_lla(0, 0)
@@ -1151,6 +1228,10 @@ class HashList(DataClassORJSONMixin):
             Point(rtk_real_loc.latitude, rtk_real_loc.longitude),
             yaw=rtk.yaw,
         )
+        self.mow_path_geojson_hash = self._cached_mow_path_hash()
+        self.mow_path_geojson_origin_lat = rtk.latitude
+        self.mow_path_geojson_origin_lon = rtk.longitude
+        self.mow_path_geojson_yaw = rtk.yaw
 
         return self.generated_mow_path_geojson
 

@@ -15,16 +15,25 @@ generate_geojson.py); saga/state-reducer flows live in their own modules.
 from __future__ import annotations
 
 import json
+import math
 
 from pymammotion.data.model.hash_list import (
     AreaHashNameList,
+    CommDataCouple,
     FrameList,
     HashList,
+    MowPath,
+    MowPathPacket,
     NavGetCommData,
     NavGetHashListData,
     NavNameTime,
     PathType,
 )
+from pymammotion.data.model.location import LocationPoint
+
+# A synthetic RTK origin in the radians the wire carries, built from round degrees so it is
+# obviously invented. Tests here must never carry a real deployment's coordinates.
+_ORIGIN = (math.radians(50.0), math.radians(10.0))
 
 
 # ---------------------------------------------------------------------------
@@ -826,3 +835,139 @@ class TestLuba3SnapshotAreaNames:
     def test_survives_a_storage_round_trip(self) -> None:
         restored = HashList.from_dict(json.loads(json.dumps(self._snapshot().to_dict())))
         assert {a.hash: a.name for a in restored.computed_areas} == dict((h, n) for n, h in self._NAMES)
+
+
+# ---------------------------------------------------------------------------
+# HashList.geojson_needs_regeneration
+# ---------------------------------------------------------------------------
+
+
+def _generated_against(origin: tuple[float, float], yaw: float = 0.0) -> HashList:
+    """A HashList holding GeoJSON as if it had been built against *origin* (radians)."""
+    hash_list = HashList()
+    hash_list.generated_geojson = {"type": "FeatureCollection", "features": []}
+    hash_list.geojson_origin_lat, hash_list.geojson_origin_lon = origin
+    hash_list.geojson_yaw = yaw
+    return hash_list
+
+
+def test_geojson_is_kept_when_the_origin_and_yaw_are_unchanged() -> None:
+    origin = _ORIGIN
+    hash_list = _generated_against(origin)
+
+    assert not hash_list.geojson_needs_regeneration(LocationPoint(latitude=origin[0], longitude=origin[1]))
+
+
+def test_a_changed_origin_forces_a_rebuild() -> None:
+    """Every coordinate in the stored GeoJSON is an ENU offset projected through the origin, so a
+    new origin moves the whole map. Nothing else would ask for the rebuild: the map hashes are
+    identical — the device's map did not change, only where it is anchored."""
+    origin = _ORIGIN
+    hash_list = _generated_against(origin)
+
+    # ~30 m north of the origin, the scale of a session run against the wrong one.
+    moved = LocationPoint(latitude=origin[0] + 4.7e-6, longitude=origin[1])
+
+    assert hash_list.geojson_needs_regeneration(moved)
+
+
+def test_an_origin_that_only_wobbled_in_the_last_digits_is_not_a_rebuild() -> None:
+    """The threshold is ~0.6 m: far above float noise from the radians conversion, far below the
+    displacement a wrong origin produces. Rebuilding is O(N) on the hot path, so it must not fire
+    on a value that is the same fact."""
+    origin = _ORIGIN
+    hash_list = _generated_against(origin)
+
+    assert not hash_list.geojson_needs_regeneration(
+        LocationPoint(latitude=origin[0] + 1e-12, longitude=origin[1] - 1e-12)
+    )
+
+
+# ---------------------------------------------------------------------------
+# HashList.mow_path_needs_regeneration
+# ---------------------------------------------------------------------------
+
+_RTK = LocationPoint(latitude=_ORIGIN[0], longitude=_ORIGIN[1])
+
+
+def _with_cover_path(path_hash: int = 7777) -> HashList:
+    """A HashList holding one complete cover-path frame, as `cover_path_upload` leaves it."""
+    hash_list = HashList()
+    hash_list.update_mow_path(
+        MowPath(
+            total_frame=1,
+            current_frame=1,
+            transaction_id=1,
+            path_packets=[MowPathPacket(path_hash=path_hash, data_couple=[CommDataCouple(x=1.0, y=2.0)])],
+        )
+    )
+    return hash_list
+
+
+def test_cached_frames_with_no_geojson_are_outstanding_work() -> None:
+    """The case the retry exists for: the frames arrived while a saga owned the queue, so nothing
+    converted them. They are not lost — they are cached data that never became a layer, and until
+    now nothing ever asked again."""
+    assert _with_cover_path().mow_path_needs_regeneration(_RTK)
+
+
+def test_nothing_is_outstanding_once_it_has_been_built() -> None:
+    hash_list = _with_cover_path()
+    hash_list.generate_mowing_geojson(_RTK)
+
+    assert not hash_list.mow_path_needs_regeneration(_RTK)
+
+
+def test_a_path_with_no_origin_yet_is_not_built_and_stays_outstanding() -> None:
+    """Building against the unset origin would anchor the path at null island — a well-formed
+    result nothing downstream can tell from a real one. Better to hold the work open until the
+    origin arrives, which is what the caller then acts on."""
+    hash_list = _with_cover_path()
+
+    hash_list.generate_mowing_geojson(LocationPoint())
+
+    assert hash_list.generated_mow_path_geojson == {}
+    assert not hash_list.mow_path_needs_regeneration(LocationPoint())  # nothing to build against
+    assert hash_list.mow_path_needs_regeneration(_RTK)  # ...but the moment there is, it is due
+
+
+def test_a_new_route_makes_the_built_path_stale() -> None:
+    """Frames for a different route replace what the GeoJSON represents. Without the route hash
+    in the comparison an unconverted second job would look already-done, since the origin it
+    would be built against is the same one."""
+    hash_list = _with_cover_path(path_hash=1111)
+    hash_list.generate_mowing_geojson(_RTK)
+
+    hash_list.current_mow_path = {}
+    hash_list.update_mow_path(
+        MowPath(
+            total_frame=1,
+            current_frame=1,
+            transaction_id=2,
+            path_packets=[MowPathPacket(path_hash=2222, data_couple=[CommDataCouple(x=3.0, y=4.0)])],
+        )
+    )
+
+    assert hash_list.mow_path_needs_regeneration(_RTK)
+
+
+def test_a_moved_origin_makes_the_built_path_stale() -> None:
+    """Same reason the map geometry rebuilds on a changed origin: every coordinate in the stored
+    path is an ENU offset projected through it."""
+    hash_list = _with_cover_path()
+    hash_list.generate_mowing_geojson(_RTK)
+
+    moved = LocationPoint(latitude=_RTK.latitude + 4.7e-6, longitude=_RTK.longitude)
+
+    assert hash_list.mow_path_needs_regeneration(moved)
+
+
+def test_an_incomplete_frame_set_is_not_built() -> None:
+    """Half a route drawn as if it were the whole one is worse than no route: the missing frames
+    read as ground the mower never planned to cover."""
+    hash_list = HashList()
+    hash_list.update_mow_path(
+        MowPath(total_frame=3, current_frame=1, transaction_id=1, path_packets=[MowPathPacket(path_hash=9)])
+    )
+
+    assert not hash_list.mow_path_needs_regeneration(_RTK)

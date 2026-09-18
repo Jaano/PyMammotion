@@ -2,9 +2,13 @@
 from __future__ import annotations
 
 import json
+import math
+
+import pytest
 
 from pymammotion.data.model.device import MowingDevice
 from pymammotion.data.model.hash_list import FrameList, HashList, MowPath, NavGetCommData
+from pymammotion.proto import MqttRtkConnect, ReportInfoData, RptDevLocation, RptRtk
 
 
 def _make_hash_list_with_int_keys() -> HashList:
@@ -98,3 +102,69 @@ def test_seeds_version_feeds_detection_gate() -> None:
     device.apply_version_check(_check("1.11.0"))  # below the 1.12.0 threshold
     options = DetectionStrategy.for_device(device.name, device.device_firmwares.device_version)
     assert DetectionStrategy.slow_touch in options  # old-firmware option set
+
+
+# ---------------------------------------------------------------------------
+# MowingDevice.update_report_data — the RTK origin behind every position
+# ---------------------------------------------------------------------------
+
+# One report frame's shape: the mower ~30 m from its origin, plus the device's own absolute
+# reading of that same point. The two are related by exactly the ENU offset, which is what shows
+# `mqtt_rtk_info` to be a position rather than an origin.
+#
+# The origin is synthetic — round degrees converted to the radians the wire carries. Tests here
+# must never carry a real deployment's coordinates.
+_ORIGIN = (math.radians(50.0), math.radians(10.0))
+_ENU_OFFSET = (-298_000, 61_900)  # real_pos_x / real_pos_y, 1e-4 m — 29.8 m west, 6.19 m north
+
+
+def _expected_position() -> tuple[float, float]:
+    """Where `_ENU_OFFSET` from `_ORIGIN` lands, in degrees, by flat-earth arithmetic.
+
+    Deliberately not the library's own ECEF conversion: an expectation computed the same way as
+    the thing under test restates it instead of checking it. Over tens of metres the two agree far
+    inside the tolerance the assertions use.
+    """
+    lat0, lon0 = math.degrees(_ORIGIN[0]), math.degrees(_ORIGIN[1])
+    metres_per_degree_lat = 111_320.0
+    east, north = _ENU_OFFSET[0] / 1e4, _ENU_OFFSET[1] / 1e4
+    return (
+        lat0 + north / metres_per_degree_lat,
+        lon0 + east / (metres_per_degree_lat * math.cos(math.radians(lat0))),
+    )
+
+
+def _report() -> ReportInfoData:
+    reported_lat, reported_lon = _expected_position()
+    return ReportInfoData(
+        rtk=RptRtk(mqtt_rtk_info=MqttRtkConnect(latitude=reported_lat, longitude=reported_lon)),
+        locations=[RptDevLocation(real_pos_x=_ENU_OFFSET[0], real_pos_y=_ENU_OFFSET[1], pos_type=4)],
+    )
+
+
+def test_no_position_until_an_origin_has_been_seen() -> None:
+    """`mqtt_rtk_info` is the device's own position, not its origin, so it cannot stand in for one:
+    seeding the origin with it offsets every position computed afterwards by however far the mower
+    stood from the real origin — tens of metres while mowing — and produces a well-formed
+    coordinate nothing downstream can tell from a correct one. With no origin the position stays
+    at the collapsed (0, 0) anchor, which every consumer already rejects as the no-fix sentinel."""
+    device = MowingDevice()
+
+    device.update_report_data(_report())
+
+    assert abs(device.location.device.latitude) < 1.0
+    assert abs(device.location.device.longitude) < 1.0
+    assert device.location.RTK.latitude == 0.0
+
+
+def test_the_origin_from_the_buffer_puts_the_position_where_the_device_says_it_is() -> None:
+    """With the real origin in hand the projection reproduces the device's own absolute reading of
+    the same point — which is the whole reason that reading can be used to check the origin."""
+    device = MowingDevice()
+    device.location.RTK.latitude, device.location.RTK.longitude = _ORIGIN
+
+    device.update_report_data(_report())
+
+    expected_lat, expected_lon = _expected_position()
+    assert device.location.device.latitude == pytest.approx(expected_lat, abs=1e-5)
+    assert device.location.device.longitude == pytest.approx(expected_lon, abs=1e-5)

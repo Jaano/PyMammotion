@@ -336,17 +336,16 @@ class MowerDevice(Device):
     def update_report_data(self, toapp_report_data: ReportInfoData) -> None:
         """Set report data for the mower."""
 
-        # adjust for vision models
-        if (
-            (rtk := toapp_report_data.rtk)
-            and (mqtt_rtk := rtk.mqtt_rtk_info)
-            and self.location.RTK.latitude == 0.0
-            and self.location.RTK.longitude == 0.0
-        ):
-            if mqtt_rtk.latitude != 0.0:
-                self.location.RTK.longitude = math.radians(mqtt_rtk.longitude)
-                self.location.RTK.latitude = math.radians(mqtt_rtk.latitude)
-
+        # ``location.RTK`` is seeded only from ``systemUpdateBuf`` (see ``buffer``). It is
+        # deliberately NOT seeded from ``rtk.mqtt_rtk_info`` while still unset: that field is the
+        # device's own *absolute position*, not its origin — on live captures it tracks
+        # ``locations[0].real_pos_x``/``real_pos_y`` from the same frame to within 0.06 m on
+        # average. Using it as the origin therefore offsets every position computed until the real
+        # origin arrives by however far the mower stood from that origin at the time (tens of
+        # metres while mowing), and the result is a well-formed coordinate that nothing downstream
+        # can tell from a correct one. Until an origin has been seen the converter is anchored at
+        # (0, 0), which puts ``location.device`` in the Gulf of Guinea — a position consumers
+        # already reject as the no-fix sentinel, and one nobody mistakes for the lawn.
         coordinate_converter = CoordinateConverter(self.location.RTK.latitude, self.location.RTK.longitude)
         for index, location in enumerate(toapp_report_data.locations):
             if index == 0:

@@ -507,24 +507,42 @@ class MowerStateReducer(StateReducer):
                 device.work_session_result.work_type = work_report.work_type
                 device.work_session_result.work_result = work_report.work_result
 
+    def _refresh_mow_path_geojson(self, device: MowingDevice) -> None:
+        """Convert cached cover-path frames that were never turned into GeoJSON.
+
+        ``cover_path_upload`` converts them as the last frame lands, but only when no saga owns
+        the queue and only usefully once the RTK origin is known — and neither condition retries.
+        So a cover path that arrived during a map fetch, or before the origin did, stayed cached
+        as data that never became a layer until the next job start replaced it.  This is the
+        retry, on the two sys ticks that carry the facts which unblock it: the buffer that
+        delivers the origin, and the report that keeps arriving regardless.
+
+        ``mow_path_needs_regeneration`` answers "no" in a few comparisons in the steady state, so
+        running it on the report tick costs nothing measurable.
+        """
+        if self._is_saga_active() or not device.map.mow_path_needs_regeneration(device.location.RTK):
+            return
+        device.map.generate_mowing_geojson(device.location.RTK)
+
     def _update_sys_data(self, device: MowingDevice, message: LubaMsg) -> None:
         """Update system data fields on *device* in-place."""
         sys_msg = betterproto2.which_one_of(message.sys, "SubSysMsg")  # type: ignore
         match sys_msg[0]:
             case "system_update_buf":
                 device.buffer(sys_msg[1])  # type: ignore
-                # If the RTK yaw just arrived or changed, regenerate any GeoJSON
-                # that was built without (or with a different) yaw correction.
-                # Skip during sagas — the saga's on_complete handler will
-                # regenerate with the correct yaw once the fetch is done.
+                # If the RTK origin or yaw just arrived or changed, regenerate any GeoJSON that
+                # was built without it (or against a different one).  Skip during sagas — the
+                # saga's on_complete handler will regenerate once the fetch is done.
                 if (
                     not self._is_saga_active()
                     and device.map.area
                     and device.map.geojson_needs_regeneration(device.location.RTK)
                 ):
                     device.map.generate_geojson(device.location.RTK, device.location.dock)
+                self._refresh_mow_path_geojson(device)
             case "toapp_report_data":
                 device.update_report_data(sys_msg[1])  # type: ignore
+                self._refresh_mow_path_geojson(device)
             case "mow_to_app_info":
                 device.mow_info(sys_msg[1])  # type: ignore
             case "system_tard_state_tunnel":
