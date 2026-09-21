@@ -27,7 +27,7 @@ if TYPE_CHECKING:
     from bleak.backends.device import BLEDevice
 
     from pymammotion.bluetooth.manager import BLEDeviceEntry
-    from pymammotion.data.model.device import MowingDevice
+    from pymammotion.data.model.device import Device
     from pymammotion.device.handle import DeviceHandle, DeviceRegistry
 
 _logger = logging.getLogger(__name__)
@@ -125,7 +125,7 @@ class BleInventory:
         self,
         device_id: str,
         device_name: str,
-        initial_device: MowingDevice,
+        initial_device: Device,
         *,
         ble_device: BLEDevice | None = None,
         ble_address: str | None = None,
@@ -148,7 +148,10 @@ class BleInventory:
             device_id:             Unique device identifier (e.g. ``"Luba-XXXXXX"``) —
                                    must match the cloud device name for adoption.
             device_name:           Human-readable name shown in HA.
-            initial_device:        Empty or cached ``MowingDevice`` for initial state.
+            initial_device:        Empty or cached device state — a ``MowingDevice``
+                                   for a mower, a ``PoolCleanerDevice`` for a Spino.
+                                   ``DeviceHandle`` picks its reducer from the device
+                                   name, so the two must agree.
             ble_device:            Optional pre-discovered bleak ``BLEDevice``.
             ble_address:           Optional MAC.  Required when ``ble_device``
                                    is not supplied.  Stored in the transport
@@ -268,17 +271,28 @@ class BleInventory:
         if transport is not None and not transport.is_connected:
             await transport.connect()
 
-    async def add_ble_to_device(self, device_name: str, ble_device: BLEDevice, account_id: str | None = None) -> None:
+    async def add_ble_to_device(
+        self,
+        device_name: str,
+        ble_device: BLEDevice,
+        account_id: str | None = None,
+        rssi: int | None = None,
+    ) -> None:
         """Attach a BLE transport to an already-registered device, or refresh the one it has.
 
         Args:
             device_name: Registered device name.
             ble_device:  The bleak ``BLEDevice`` to use for the BLE connection.
             account_id:  Disambiguates a device several accounts hold.
+            rssi:        Advertisement RSSI (dBm).  Pass it whenever the caller
+                has it: a transport that went unusable on a weak signal can only
+                become usable again once a stronger RSSI is recorded, and this
+                is the call hosts make on every advertisement.  ``None`` leaves
+                the last known RSSI untouched.
 
         """
         handle = self._device_registry.get_by_name(device_name, account_id)
         if handle is None:
             _logger.warning("add_ble_to_device: device '%s' not registered", device_name)
             return
-        await self._attach_ble(handle, ble_device)
+        await self._attach_ble(handle, ble_device, rssi)

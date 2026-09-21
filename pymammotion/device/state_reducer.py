@@ -932,11 +932,15 @@ def _apply_ota_property(device: Device, progress: int, result: int) -> bool:
     return status.is_complete
 
 
-def _apply_rtk_coordinate(device: RTKBaseStationDevice, lat: float | None, lon: float | None) -> None:
+def apply_rtk_coordinate(device: RTKBaseStationDevice, lat: float | None, lon: float | None) -> None:
     """Store an RTK ``coordinate`` push (radians); zero means unset and is skipped.
 
-    a1Nc68bGZzX devices report latitude 436° low (value is in radians); the guard on
-    out-of-range keeps a firmware fix from shifting it again.
+    a1Nc68bGZzX devices report the coordinate 436° low (Mammotion-HA #563: a
+    western-hemisphere longitude below -360°).  Each axis is guarded by its own
+    valid range so a value that arrives correct is never shifted, and a shifted
+    one always is -- 436° is far enough that it cannot land back in range.
+    Guarding longitude at pi/2 corrupted every base station east of 90°E or west
+    of 90°W, whose true longitude is legitimately larger than that (issue #188).
     """
     shift = math.radians(436) if device.product_key == "a1Nc68bGZzX" else 0.0
     if lat:
@@ -944,7 +948,7 @@ def _apply_rtk_coordinate(device: RTKBaseStationDevice, lat: float | None, lon: 
         device.lat = raw_lat + shift if shift and abs(raw_lat) > math.pi / 2 else raw_lat
     if lon:
         raw_lon = float(lon)
-        device.lon = raw_lon + shift if shift and abs(raw_lon) > math.pi / 2 else raw_lon
+        device.lon = raw_lon + shift if shift and abs(raw_lon) > math.pi else raw_lon
 
 
 def _apply_rtk_version_info(
@@ -1488,7 +1492,7 @@ class RTKStateReducer(StateReducer):
         if coord_prop := items.coordinate:
             try:
                 coord = json.loads(coord_prop.value)  # type: ignore
-                _apply_rtk_coordinate(device, coord.get("lat"), coord.get("lon"))
+                apply_rtk_coordinate(device, coord.get("lat"), coord.get("lon"))
             except (ValueError, KeyError, TypeError):
                 _logger.debug("RTKStateReducer: failed to parse coordinate property")
 
@@ -1538,7 +1542,7 @@ class RTKStateReducer(StateReducer):
         p = properties.params
 
         if (coord := p.coordinate) is not None:
-            _apply_rtk_coordinate(device, coord.lat, coord.lon)
+            apply_rtk_coordinate(device, coord.lat, coord.lon)
 
         if net := p.network_info:
             if net.wifi_rssi:

@@ -11,54 +11,13 @@ from pymammotion.messaging.broker import DeviceMessageBroker
 from pymammotion.messaging.map_saga import MapFetchSaga
 from pymammotion.proto import LubaMsg
 from tests.unit.messaging._helpers import (
+    apply_msg_to_map as _apply_msg_to_map,
     area_frame_named as _area_frame_named,
     comm_data_frame as _comm_data_msg,
     hash_list_msg as _hash_list_msg,
     make_command_builder as _make_command_builder,
+    run_saga_with_messages as _run_saga_with_messages,
 )
-
-
-def _apply_msg_to_map(msg: LubaMsg, m: HashList) -> None:
-    """Minimal StateReducer simulation: update m with each incoming nav message."""
-    if not msg.nav:
-        return
-    try:
-        leaf_name, leaf_val = betterproto2.which_one_of(msg.nav, "SubNavMsg")
-        if leaf_name == "toapp_gethash_ack":
-            m.update_root_hash_list(NavGetHashListData.from_dict(leaf_val.to_dict(casing=betterproto2.Casing.SNAKE)))
-        elif leaf_name == "toapp_get_commondata_ack":
-            m.update(NavGetCommData.from_dict(leaf_val.to_dict(casing=betterproto2.Casing.SNAKE)))
-    except Exception:  # noqa: BLE001
-        pass
-
-
-async def _run_saga_with_messages(
-    broker: DeviceMessageBroker,
-    saga: MapFetchSaga,
-    messages: list[LubaMsg],
-    delay: float = 0.02,
-    map_update: HashList | None = None,
-) -> None:
-    """Drive saga + sequential message injection concurrently.
-
-    If *map_update* is provided, each message is also applied to that HashList
-    to simulate the StateReducer updating device.map before the saga reads it.
-    """
-
-    async def _inject() -> None:
-        for msg in messages:
-            await asyncio.sleep(delay)
-            if map_update is not None:
-                _apply_msg_to_map(msg, map_update)
-            await broker.on_message(msg)
-
-    injector = asyncio.create_task(_inject())
-    try:
-        await saga.execute(broker)
-    finally:
-        injector.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await injector
 
 
 # test 1 — known type (area=0): saga stores data and terminates normally
