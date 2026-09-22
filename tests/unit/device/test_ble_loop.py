@@ -203,3 +203,51 @@ async def test_active_stream_keep_call_site_matches_real_handle() -> None:
     cfg = LubaMsg().parse(sent_bytes).sys.todev_report_cfg
     assert cfg.act == RptAct.RPT_KEEP
     assert cfg.count == 0
+
+
+@pytest.mark.asyncio
+async def test_start_report_stream_keep_branch_renews_against_real_handle() -> None:
+    """Regression: the sibling above covers ``ble_loop``'s no-arg call site, but
+    ``start_report_stream``'s own "stream already active" branch is a *second* caller of
+    ``send_report_stream_keep`` — and it was the uncovered one.  Its body referenced a
+    ``duration_ms`` that the signature did not declare, so every renew raised ``NameError``
+    in production while this suite stayed green: the loop-host tests all replace the method
+    with an ``AsyncMock()``.  Drive the branch against a real DeviceHandle so the frame is
+    actually built.
+    """
+    from pymammotion.device.handle import DeviceHandle
+    from pymammotion.proto import LubaMsg
+
+    device = MagicMock()
+    handle = DeviceHandle(device_id="dev1", device_name="Mower One", initial_device=device)
+
+    handle.cadence_mode = MagicMock(return_value=_DeviceMode.ACTIVE)  # type: ignore[method-assign]
+    handle._ble_stream_active = False
+    # A live stop timer is what makes the branch read as "already streaming".
+    handle._report_stream_timer = MagicMock()
+
+    sent: list[bytes] = []
+
+    async def _capture(cmd_bytes: bytes, _send_fn: object) -> bool:
+        sent.append(cmd_bytes)
+        return True
+
+    handle._send_rpt_start_verified = _capture  # type: ignore[method-assign]
+
+    async def _run_enqueued_immediately(work: object, **_kwargs: object) -> None:
+        await work()  # type: ignore[operator]
+
+    handle.queue.enqueue = _run_enqueued_immediately  # type: ignore[method-assign]
+
+    try:
+        await handle.start_report_stream(120_000)
+    finally:
+        if handle._report_stream_timer is not None:
+            handle._report_stream_timer.cancel()
+
+    assert len(sent) == 1
+    cfg = LubaMsg().parse(sent[0]).sys.todev_report_cfg
+    assert cfg.act == RptAct.RPT_KEEP
+    assert cfg.count == 0
+    # The renew carries the window the caller armed, not a hardcoded one.
+    assert cfg.timeout == 120_000
