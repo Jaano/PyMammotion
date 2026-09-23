@@ -1262,20 +1262,11 @@ def apply_area_geojson(hash_list: HashList, rtk: LocationPoint, dock: Dock) -> N
         int(dock_rotation),
         yaw=rtk.yaw,
     )
-    hash_list.record_geojson_state(rtk)
+    hash_list.record_geojson_state(rtk.yaw)
 
 
 def apply_mowing_geojson(hash_list: HashList, rtk: LocationPoint) -> Any:
-    """Rebuild ``hash_list.generated_mow_path_geojson`` from the cached mow-path frames.
-
-    No-op while the RTK origin is unset, like ``apply_mow_progress_geojson``: the projection
-    would anchor every coordinate at null island, and a previously-good path is better kept than
-    replaced with that.  ``mow_path_needs_regeneration`` then still reports the work outstanding,
-    so the next tick after the origin arrives builds it.
-    """
-    if rtk.latitude == 0.0:
-        return hash_list.generated_mow_path_geojson
-
+    """Rebuild ``hash_list.generated_mow_path_geojson`` from the cached mow-path frames."""
     coordinator_converter = CoordinateConverter(rtk.latitude, rtk.longitude)
     rtk_real_loc = coordinator_converter.enu_to_lla(0, 0)
 
@@ -1284,7 +1275,6 @@ def apply_mowing_geojson(hash_list: HashList, rtk: LocationPoint) -> Any:
         Point(rtk_real_loc.latitude, rtk_real_loc.longitude),
         yaw=rtk.yaw,
     )
-    hash_list.record_mow_path_geojson_state(rtk)
     return hash_list.generated_mow_path_geojson
 
 
