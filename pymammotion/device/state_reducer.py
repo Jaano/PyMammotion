@@ -549,6 +549,7 @@ class MowerStateReducer(StateReducer):
                     and device.map.geojson_needs_regeneration(device.location.RTK)
                 ):
                     apply_area_geojson(device.map, device.location.RTK, device.location.dock)
+                self._refresh_mow_path_geojson(device)
             case "toapp_report_data":
                 device.update_report_data(sys_msg[1])  # type: ignore
                 self._refresh_mow_path_geojson(device)

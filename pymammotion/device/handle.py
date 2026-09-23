@@ -1614,7 +1614,7 @@ class DeviceHandle:
                     "RPT_KEEP" if already_streaming else "RPT_START",
                 )
             if already_streaming:
-                await self.send_report_stream_keep()
+                await self.send_report_stream_keep(duration_ms)
             else:
                 await self._send_report_stream_start(duration_ms)
 
@@ -1708,8 +1708,15 @@ class DeviceHandle:
 
         await self.queue.enqueue(_send, priority=Priority.BACKGROUND, skip_if_saga_active=True)
 
-    async def send_report_stream_keep(self) -> None:
-        """Enqueue RPT_KEEP to refresh an already-active continuous stream."""
+    async def send_report_stream_keep(self, duration_ms: int = 300_000) -> None:
+        """Enqueue RPT_KEEP to refresh an already-active continuous stream.
+
+        ``duration_ms`` renews the device-side window RPT_START opened rather than
+        replacing it.  It is defaulted because the loop-host callers
+        (``ble_loop``'s staleness watchdog, :class:`LoopHost`) renew the default
+        window and have no duration of their own; ``start_report_stream`` passes
+        the window it actually armed.
+        """
         cmd_bytes = self.commands.request_iot_sys(
             rpt_act=RptAct.RPT_KEEP,
             rpt_info_type=_REPORT_CHANNELS,

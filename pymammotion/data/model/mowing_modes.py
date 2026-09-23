@@ -171,49 +171,6 @@ _OPTION_KEYS: dict[DetectionStrategy, str] = {
     DetectionStrategy.sensitive: "sensitive",
 }
 
-    def option_key(self, options: list[DetectionStrategy]) -> str:
-        """Return the app's label key for this strategy within *options*.
-
-        ``SettingOptionsView.initBypassingStrategy`` labels by value *and* by
-        which list the device has: 0 is always the off position, and 1 is
-        "Slow touch" only on the older lists that also carry 0 — on the new
-        Off/Standard/Sensitive list, 1 *is* the off position.
-
-        (The app additionally falls back to "Off" for 1 on any list shorter
-        than four, which would label two of Luba 1's three tabs identically;
-        keying off the presence of 0 keeps every option distinct.)
-        """
-        if self is DetectionStrategy.slow_touch and DetectionStrategy.direct_touch not in options:
-            return "off"
-        return _OPTION_KEYS[self]
-
-    @classmethod
-    def from_option_key(cls, key: str, options: list[DetectionStrategy]) -> DetectionStrategy:
-        """Resolve a label key back to the strategy *options* uses for it.
-
-        Raises:
-            ValueError: if *key* is not one of the keys *options* presents.
-
-        """
-        for strategy in options:
-            if strategy.option_key(options) == key:
-                return strategy
-        msg = f"{key!r} is not an obstacle-detection option of {[s.name for s in options]}"
-        raise ValueError(msg)
-
-
-
-#: Label key per strategy, named after the APK string each tab renders
-#: (``state_close`` / ``title_slow_touch`` / ``title_less_touch`` /
-#: ``title_standard`` / ``title_proguard``).  ``slow_touch`` is the one that
-#: depends on the device's list — see :meth:`DetectionStrategy.option_key`.
-_OPTION_KEYS: dict[DetectionStrategy, str] = {
-    DetectionStrategy.direct_touch: "off",
-    DetectionStrategy.slow_touch: "slow_touch",
-    DetectionStrategy.less_touch: "less_touch",
-    DetectionStrategy.no_touch: "standard",
-    DetectionStrategy.sensitive: "sensitive",
-}
 
 class WildlifeSafety(IntEnum):
     """Wildlife / animal protection behaviour when an animal is detected.

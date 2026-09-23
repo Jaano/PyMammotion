@@ -29,8 +29,8 @@ from pymammotion.data.model.hash_list import (
     NavNameTime,
     PathType,
 )
-from pymammotion.data.model.generate_geojson import apply_mowing_geojson
-from pymammotion.data.model.location import LocationPoint
+from pymammotion.data.model.generate_geojson import apply_area_geojson, apply_mowing_geojson
+from pymammotion.data.model.location import Dock, LocationPoint
 
 # A synthetic RTK origin in the radians the wire carries, built from round degrees so it is
 # obviously invented. Tests here must never carry a real deployment's coordinates.
@@ -844,6 +844,22 @@ def test_an_origin_that_only_wobbled_in_the_last_digits_is_not_a_rebuild() -> No
     assert not hash_list.geojson_needs_regeneration(
         LocationPoint(latitude=origin[0] + 1e-12, longitude=origin[1] - 1e-12)
     )
+
+
+def test_apply_area_geojson_records_the_origin_it_built_against() -> None:
+    """The write side of the pair above: `apply_area_geojson` must actually record the origin it
+    was called with, or `geojson_needs_regeneration` has nothing true to compare against and
+    reports every call stale — an O(N) rebuild on a ~4 Hz path, with no exception and no failing
+    assertion anywhere near the cause."""
+    hash_list = HashList()
+    rtk = LocationPoint(latitude=_ORIGIN[0], longitude=_ORIGIN[1], yaw=0.3)
+    dock = Dock(latitude=_ORIGIN[0], longitude=_ORIGIN[1], rotation=0.0)
+
+    apply_area_geojson(hash_list, rtk, dock)
+
+    assert hash_list.geojson_origin_lat == rtk.latitude
+    assert hash_list.geojson_origin_lon == rtk.longitude
+    assert not hash_list.geojson_needs_regeneration(rtk)
 
 
 # ---------------------------------------------------------------------------

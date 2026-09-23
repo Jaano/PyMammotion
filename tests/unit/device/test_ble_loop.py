@@ -21,6 +21,7 @@ import asyncio
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 
 from pymammotion.device.ble_loop import (
     _BLE_STREAM_STALE_THRESHOLD,
@@ -28,6 +29,7 @@ from pymammotion.device.ble_loop import (
 )
 from pymammotion.device.modes import _DeviceMode
 from pymammotion.proto import RptAct
+from pymammotion.transport.base import TransportType
 
 
 def _make_loop_host() -> MagicMock:

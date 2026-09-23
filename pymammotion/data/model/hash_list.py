@@ -1208,7 +1208,44 @@ class HashList(DataClassORJSONMixin):
         }
         return bool(geojson_hashes - current_hashlist)
 
-    def record_geojson_state(self, yaw: float) -> None:
+    def _cached_mow_path_hash(self) -> int:
+        """Route hash the cached cover-path frames belong to, or 0 when none are cached."""
+        for frames in self.current_mow_path.values():
+            for mow_path in frames.values():
+                if mow_path.path_packets:
+                    return mow_path.path_packets[0].path_hash
+        return 0
+
+    def mow_path_needs_regeneration(
+        self, rtk: LocationPoint, yaw_threshold: float = 0.01, origin_threshold: float = 1e-7
+    ) -> bool:
+        """Return True if cached cover-path frames exist that ``generated_mow_path_geojson`` does
+        not represent — a different route, a different origin or yaw, or never built at all.
+
+        The conversion when the last frame lands is one-shot and conditional (skipped while a saga
+        owns the queue, and useless before the RTK origin is known), and neither condition retries
+        itself.  Ordered so the steady state costs a few comparisons and never walks the frames.
+        """
+        if not self.current_mow_path or rtk.latitude == 0.0:
+            return False
+        if (
+            self.mow_path_geojson_origin_lat != 0.0
+            and self.mow_path_geojson_hash == self._cached_mow_path_hash()
+            and abs(rtk.latitude - self.mow_path_geojson_origin_lat) <= origin_threshold
+            and abs(rtk.longitude - self.mow_path_geojson_origin_lon) <= origin_threshold
+            and abs(rtk.yaw - self.mow_path_geojson_yaw) <= yaw_threshold
+        ):
+            return False
+        return not self.find_missing_mow_path_frames()
+
+    def record_mow_path_geojson_state(self, rtk: LocationPoint) -> None:
+        """Note the route hash, origin and yaw ``generated_mow_path_geojson`` was built from."""
+        self.mow_path_geojson_hash = self._cached_mow_path_hash()
+        self.mow_path_geojson_origin_lat = rtk.latitude
+        self.mow_path_geojson_origin_lon = rtk.longitude
+        self.mow_path_geojson_yaw = rtk.yaw
+
+    def record_geojson_state(self, rtk: LocationPoint) -> None:
         """Note the yaw and hashlist that ``generated_geojson`` was built from.
 
         Paired with :meth:`geojson_needs_regeneration`, which reads both back — the
@@ -1216,5 +1253,7 @@ class HashList(DataClassORJSONMixin):
         ``generate_geojson`` (which needs to import this module, so this one must not
         import it back).
         """
-        self.geojson_yaw = yaw
+        self.geojson_yaw = rtk.yaw
+        self.geojson_origin_lat = rtk.latitude
+        self.geojson_origin_lon = rtk.longitude
         self._geojson_hashlist_snapshot = frozenset(self.area_root_hashlist)

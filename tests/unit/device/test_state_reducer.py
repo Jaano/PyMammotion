@@ -16,8 +16,10 @@ from __future__ import annotations
 import gc
 import tracemalloc
 
+import pytest
+
 from pymammotion.data.model.device import MowerDevice
-from pymammotion.data.model.hash_list import CommDataCouple, FrameList as _FL, NavGetCommData
+from pymammotion.data.model.hash_list import CommDataCouple, FrameList as _FL, MowPath, MowPathPacket, NavGetCommData
 from pymammotion.data.model.report_info import (
     ConnectData,
     DeviceData,
@@ -33,6 +35,7 @@ from pymammotion.proto import (
     AreaHashName as _AHName,
     LubaMsg,
     MctlNav,
+    MctlSys,
     MulSetVideoAck,
     MulVideoErrorCode,
     NavGetAllPlanTask,
@@ -46,6 +49,7 @@ from pymammotion.proto import (
     RptRtk,
     RptWork,
     SocMul,
+    SystemUpdateBufMsg,
     VioToAppInfoMsg,
 )
 from tests.unit.device._helpers import make_reducer_device as _make_device
@@ -120,6 +124,37 @@ def test_bidire_reqconver_path_copies_nothing_but_rebinds_work() -> None:
     # But device.work was rebuilt by the handler and current.work is untouched
     assert updated.work is not original_work
     assert current.work is original_work
+
+
+@pytest.mark.regression
+def test_system_update_buf_retries_a_cover_path_that_was_waiting_for_the_origin() -> None:
+    """`_refresh_mow_path_geojson` is documented as running "on the two sys ticks that carry the
+    facts which unblock it: the buffer that delivers the origin, and the report that keeps
+    arriving regardless" — but only the `toapp_report_data` call site existed. A cover path
+    cached before the origin arrived then waited for the next report tick instead of converting
+    the moment `system_update_buf` delivered the very origin it was blocked on."""
+    reducer = MowerStateReducer()
+    current = _make_device()
+    current.map.update_mow_path(
+        MowPath(
+            total_frame=1,
+            current_frame=1,
+            transaction_id=1,
+            path_packets=[MowPathPacket(path_hash=7, data_couple=[CommDataCouple(x=1.0, y=2.0)])],
+        )
+    )
+    assert current.location.RTK.latitude == 0.0  # origin not seen yet
+    assert current.map.generated_mow_path_geojson == {}
+
+    # update_buf_data[0] == 1 selects the RTK-origin branch; index 5/6 carry lat/lon, both must
+    # be non-zero for `buffer()` to write them.
+    buf = [1, 0, 0, 0, 0, 500000000, 100000000, 0, 0, 0, 0, 0, 0, 0]
+    msg = LubaMsg(sys=MctlSys(system_update_buf=SystemUpdateBufMsg(update_buf_data=buf)))
+
+    updated = reducer.apply(current, msg)
+
+    assert updated.location.RTK.latitude != 0.0
+    assert updated.map.generated_mow_path_geojson != {}
 
 
 # Demonstrates the memory allocation growth bug from #125.
