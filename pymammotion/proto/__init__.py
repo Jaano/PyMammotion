@@ -3715,6 +3715,8 @@ class NavPlanJobSet(betterproto2.Message):
 
     toward_included_angle: "int" = betterproto2.field(38, betterproto2.TYPE_INT32)
 
+    ride_boundary_distance: "float" = betterproto2.field(39, betterproto2.TYPE_FLOAT)
+
 
 default_message_pool.register_message("", "NavPlanJobSet", NavPlanJobSet)
 

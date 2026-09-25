@@ -240,6 +240,7 @@ class MessageNavigation(AbstractMessage, ABC):
             day=plan_bean.day,
             toward_included_angle=plan_bean.toward_included_angle,
             toward_mode=0,
+            ride_boundary_distance=plan_bean.ride_boundary_distance,
         )
         logger.debug(f"Send read job plan command planBean={plan_bean}")
         return self.send_order_msg_nav(MctlNav(todev_planjob_set=build))
@@ -549,6 +550,7 @@ class MessageNavigation(AbstractMessage, ABC):
             toward_mode=int(generate_route_information.toward_mode),  # luba 2 yuka only
             reserved=generate_route_information.path_order,
             auto_change_direction=int(generate_route_information.auto_change_direction),
+            ride_boundary_distance=float(generate_route_information.ride_boundary_distance),
         )
         logger.debug(f"{self.get_device_name()}Generate route====={build}")
         logger.debug(f"Send command--Generate route information generateRouteInformation={generate_route_information}")

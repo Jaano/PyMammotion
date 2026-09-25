@@ -312,6 +312,7 @@ message NavPlanJobSet {
   int64 remained_seconds = 36;
   int32 towardMode = 37;
   int32 towardIncludedAngle = 38;
+  float ride_boundary_distance = 39;
 }
 
 message NavUnableTimeSet {

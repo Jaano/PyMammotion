@@ -47,6 +47,26 @@ def test_from_current_task_settings_keeps_the_reported_value() -> None:
     assert GenerateRouteInformation.from_current_task_settings(settings).auto_change_direction == 1
 
 
+def test_generate_route_carries_ride_boundary_distance() -> None:
+    """The app's "Ride Edge" toggle reaches the device on the generate-route command."""
+    command = MammotionCommand("Luba-VA6ABCDE", 1)
+    route = GenerateRouteInformation(one_hashs=[1], ride_boundary_distance=0.5)
+    assert _cover_path(command.generate_route_information(route)).ride_boundary_distance == 0.5
+
+
+def test_generate_route_omits_ride_boundary_distance_when_off() -> None:
+    """Off is the proto3 default, so a device that never heard of the field sees nothing."""
+    command = MammotionCommand("Luba-VS6ABCDE", 1)
+    route = GenerateRouteInformation(one_hashs=[1])
+    assert _cover_path(command.generate_route_information(route)).ride_boundary_distance == 0.0
+
+
+def test_from_current_task_settings_keeps_the_reported_ride_boundary_distance() -> None:
+    """A task read back from the device reports its Ride Edge setting."""
+    settings = CurrentTaskSettings(ride_boundary_distance=0.5)
+    assert GenerateRouteInformation.from_current_task_settings(settings).ride_boundary_distance == 0.5
+
+
 def _wire(field_number: int, wire_type: int, payload: bytes) -> bytes:
     def varint(n: int) -> bytes:
         out = bytearray()

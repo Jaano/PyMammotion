@@ -316,6 +316,7 @@ class Plan(DataClassORJSONMixin):
     remained_seconds: int = 0
     toward_mode: int = 0
     toward_included_angle: int = 0
+    ride_boundary_distance: float = 0.0
 
     # --- enable / rename helpers -----------------------------------------
     # ``reserved`` is an 8-byte buffer the device stores alongside the plan:
