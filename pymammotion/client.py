@@ -1734,8 +1734,16 @@ class MammotionClient(CloudAuthMixin):
     async def check_and_get_mow_path(self, device_name: str) -> bool:
         """Fetch the cover path for the current route unless a complete one is already cached.
 
-        When the cache is current, rebuilds mow progress from it instead.  Returns
-        True only when a fetch was enqueued.
+        The app's sequence: read the route configuration, then request the path by hash. The
+        read matters on a session that has not seen a job start, where ``device.work`` is empty
+        and there is nothing to ask with. When the cache is current, rebuilds mow progress from
+        it instead. Returns True only when a fetch was enqueued.
+
+        A cached path is never dropped here. An idle device reports ``work.path_hash == 1``
+        (820 captured reports, ``0`` never observed), so a hash mismatch against
+        ``computed_path_hash`` is the common idle case, not evidence of a genuine route change —
+        discarding the cache before the replacement arrives would blank the layer drawing it on
+        every idle poll.
         """
         handle = self._device_registry.get_by_name(device_name)
         if handle is None:
@@ -1745,15 +1753,17 @@ class MammotionClient(CloudAuthMixin):
         if device.map.is_mow_path_current(path_hash):
             apply_device_mow_progress_geojson(device)
             return False
-        if device.map.current_mow_path and device.map.computed_path_hash != path_hash:
-            # Cached lines belong to another route; a matching list with lines still
-            # missing is kept so the fetch only asks for what is absent.
-            device.map.invalidate_mow_path(0)
         if not _should_fetch_mow_path(device, handle, path_hash):
+            return False
+        # The reducer folds the reply into `device.work`, which the route info is built from.
+        await handle.send_raw(handle.commands.query_generate_route_information())
+        try:
+            current_work = GenerateRouteInformation.from_current_task_settings(device.work)
+        except Exception:  # a malformed/empty task cannot be turned into a request
+            _logger.debug("check_and_get_mow_path '%s': no usable route configuration yet", device_name)
             return False
         _logger.debug("Device %s path_hash=%d — fetching cover path", device_name, path_hash)
         try:
-            current_work = GenerateRouteInformation.from_current_task_settings(device.work)
             return await self.start_mow_path_saga(
                 device_name, zone_hashs=[], route_info=current_work, skip_planning=True
             )

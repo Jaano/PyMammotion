@@ -74,12 +74,6 @@ class MowPathSaga(Saga):
     #: Line hashes per app_request_cover_paths, as in the APK's getNoLineHash().
     cover_path_batch_size = 20
 
-    #: Re-sends of a batch request whose first frame never arrived within ``step_timeout``.
-    #: The APK does the same on the same watchdog (``HashDataManager`` fires ``handlerType_12333``
-    #: every 3 s and re-issues, up to 10 times); a request sent as a job starts is answered in
-    #: ~5 s rather than the usual ~0.5, and some are never answered at all.
-    first_frame_attempts = 4
-
     def __init__(
         self,
         command_builder: Any,
