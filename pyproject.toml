@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pymammotion"
-version = "0.9.4"
+version = "0.9.6"
 description = ""
 authors = [
     { name = "Michael Arthur", email = "michael@jumblesoft.co.nz" },
@@ -80,7 +80,7 @@ include = ["pymammotion"]
 include = ["pymammotion"]
 
 [tool.bumpver]
-current_version = "0.9.4"
+current_version = "0.9.6"
 version_pattern = "MAJOR.MINOR.PATCH[PYTAGNUM]"
 commit_message  = "Bump version {old_version} -> {new_version}"
 commit          = true
@@ -402,6 +402,8 @@ runtime-typing = false
 max-line-length-suggestions = 120
 
 [tool.pytest.ini_options]
+# Keeps a bare `pytest` from collecting scripts under examples/ and the repo root.
+testpaths = ["tests"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "session"
 # Dump every thread's stack if one test blocks this long, so an intermittent hang in
