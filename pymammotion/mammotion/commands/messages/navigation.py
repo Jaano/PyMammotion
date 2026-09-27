@@ -239,7 +239,7 @@ class MessageNavigation(AbstractMessage, ABC):
             trigger_type=plan_bean.trigger_type,
             day=plan_bean.day,
             toward_included_angle=plan_bean.toward_included_angle,
-            toward_mode=0,
+            toward_mode=plan_bean.toward_mode,
             ride_boundary_distance=plan_bean.ride_boundary_distance,
         )
         logger.debug(f"Send read job plan command planBean={plan_bean}")
