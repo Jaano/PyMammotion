@@ -1024,19 +1024,19 @@ class MammotionHTTP:
         return Response(code=resp.status, msg="success")
 
     @refresh_token_decorator
-    async def get_stream_subscription(self, iot_id: str, is_yuka: bool) -> Response[StreamSubscriptionResponse]:
-        # Prepare the payload with cameraStates based on is_yuka flag
-        """Fetch stream subscription data for a given IoT device."""
+    async def get_stream_subscription(
+        self, iot_id: str, has_rear_camera: bool, *, all_cameras: bool = False
+    ) -> Response[StreamSubscriptionResponse]:
+        """Fetch stream subscription data for a given IoT device.
 
-        payload = {"deviceId": iot_id, "mode": 0, "cameraStates": []}
-
-        # Add appropriate cameraStates based on the is_yuka flag
-        # yukas have two cameras you could view [{"cameraState": 1}, {"cameraState": 0}, {"cameraState": 1}]
-        # but its not useful so ignore this and only subscribe to the front one.
-        if is_yuka:
-            payload["cameraStates"] = [{"cameraState": 1}, {"cameraState": 0}, {"cameraState": 0}]
-        else:
-            payload["cameraStates"] = [{"cameraState": 1}, {"cameraState": 0}, {"cameraState": 0}]
+        ``cameraStates`` switches each camera slot on (1) or off (0); the device
+        publishes slot n under Agora uid n + 1.  By default only the front (left)
+        camera is requested, as the app does.  *all_cameras* also asks for the
+        second front (right) camera, plus the third, rear one when
+        *has_rear_camera*.
+        """
+        states = (1, 1, int(has_rear_camera)) if all_cameras else (1, 0, 0)
+        payload = {"deviceId": iot_id, "mode": 0, "cameraStates": [{"cameraState": state} for state in states]}
 
         async with self._client_session() as session:
             resp = await session.post(

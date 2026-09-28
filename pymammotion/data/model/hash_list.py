@@ -485,6 +485,10 @@ class HashList(DataClassORJSONMixin):
     #: from one never fetched.  Re-fetches are driven by ``plans_stale`` and by
     #: ``init_cfg_hash`` changes from there, not by a timer.
     plans_fetched: bool = False
+    #: ``work.job_id`` when the last PlanFetchSaga completed (0 outside a task job;
+    #: an ad-hoc job reports 0).  A task job still unmatched after a fetch made
+    #: during it (e.g. its task was deleted) does not need fetching again.
+    plans_fetched_job_id: int = 0
     edge_points: dict[int, EdgePoints] = field(default_factory=dict)  # hash → EdgePoints
     dynamics_line: list[CommDataCouple] = field(default_factory=list)
     """Assembled live mow-progress path from the latest type=18 fetch.
