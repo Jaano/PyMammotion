@@ -10,6 +10,7 @@ import hmac
 from http import HTTPStatus
 import json
 import logging
+import re
 import secrets
 import time
 from typing import TYPE_CHECKING, Any, TypeVar, cast
@@ -31,6 +32,7 @@ from pymammotion.const import (
 from pymammotion.data.error_codes import table_language
 from pymammotion.http.encryption import EncryptionUtils
 from pymammotion.http.model.camera_stream import StreamSubscriptionResponse, VideoResourceResponse
+from pymammotion.http.model.fpv_control import FpvControl
 from pymammotion.http.model.http import (
     CheckDeviceVersion,
     DeviceInfo,
@@ -53,10 +55,14 @@ from pymammotion.http.model.map_backup import (
     BackupMapResult,
     BackupProgressType,
 )
+from pymammotion.http.model.product_functions import ProductFunctionsData
 from pymammotion.http.model.product_params import ProductParamData
+from pymammotion.http.model.rain_protection import RainProtectionConfig
 from pymammotion.http.model.response_factory import response_factory
 from pymammotion.http.model.rtk import RTK
+from pymammotion.http.model.work_report import WorkReportPage
 from pymammotion.transport.base import AuthError, ReLoginRequiredError
+from pymammotion.utility.agora_token import describe_agora_token
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable
@@ -110,6 +116,30 @@ def _decode_cached[ModelT: DataClassORJSONMixin](value: Any, model: type[ModelT]
         with suppress(*_CACHE_DECODE_ERRORS):
             return model.from_dict(value)
     return None
+
+
+#: JSON keys (matched case-insensitively) whose string values are credentials; ``redact_secrets`` blanks them.
+_SECRET_KEYS = (
+    "token",
+    "appid",
+    "license",
+    "key",
+    "salt",
+    "accessToken",
+    "refreshToken",
+    "access_token",
+    "refresh_token",
+)
+_SECRET_VALUE_RE = re.compile(r'"(' + "|".join(_SECRET_KEYS) + r')"\s*:\s*"[^"]*"', re.IGNORECASE)
+
+
+def redact_secrets(body: str) -> str:
+    """Return *body* with every credential-bearing JSON string value replaced by ``<redacted>``.
+
+    Whole bodies are logged at DEBUG so response shapes (for example the per-camera list in a
+    stream token) stay visible; the values that would let anyone use the response do not.
+    """
+    return _SECRET_VALUE_RE.sub(lambda m: f'"{m.group(1)}":"<redacted>"', body)
 
 
 def _token_fingerprint(token: str | None) -> str:
@@ -622,15 +652,16 @@ class MammotionHTTP:
         method: str | None = None,
         headers: dict[str, str] | None = None,
     ) -> Response[_DataT]:
-        """Call a ``device-server/v1`` endpoint and parse the envelope.
+        """Call a Bearer-authenticated endpoint on the Mammotion API domain and parse the envelope.
 
         Unless ``method`` names the verb, ``payload`` selects it: a body means POST,
         no body means GET — the product list is a GET while the error-code endpoints
         are POSTs.  The map-backup endpoints add a PUT and a DELETE.  They
         otherwise differ only in path and payload model, so they share this rather
         than repeating the session/header/parse dance each time.  Note the prefix:
-        they live under ``device-server``, while the CSV export in
-        :meth:`get_all_error_codes` lives under ``user-server``.
+        they live under ``device-server``, as ``weather-server`` shares its domain and
+        auth, while the CSV export in :meth:`get_all_error_codes` lives under
+        ``user-server``.
         """
         url = f"{MAMMOTION_API_DOMAIN}{path}"
         headers = {
@@ -700,6 +731,23 @@ class MammotionHTTP:
         """
         return await self._request_device_server(
             "/device-server/v1/product/product/list", Response[list[Product]], "product list"
+        )
+
+    @refresh_token_decorator
+    async def get_product_version_functions(
+        self, product_key: str, product_version: str
+    ) -> Response[ProductFunctionsData]:
+        """Fetch the function codes the cloud lists for *product_key* at firmware *product_version*.
+
+        ``product_version`` is the main firmware version (``device_current_version_<name>``
+        in the app).  The response carries no refresh hint; the app caches it per
+        ``(productKey, productVersion)`` forever and refetches only for a new pair.
+        """
+        return await self._request_device_server(
+            "/device-server/v1/product-version-function/list",
+            Response[ProductFunctionsData],
+            "product version functions",
+            payload={"productKey": product_key, "productVersion": product_version},
         )
 
     async def get_all_error_codes_paged(
@@ -873,6 +921,66 @@ class MammotionHTTP:
         """Delete a stored backup."""
         return await self._request_device_server(
             f"/device-server/v1/map/backup/{biz_id}", Response[bool], "map backup delete", method="DELETE"
+        )
+
+    @refresh_token_decorator
+    async def get_work_report_page(
+        self, device_name: str, page_number: int = 1, page_size: int = 10
+    ) -> Response[WorkReportPage]:
+        """Fetch one page of *device_name*'s job history, newest first.
+
+        The app's ``CommonApiService.getReportsByPage``; its report list asks for
+        pages of 10.  ``records[0]`` is the job "continue last job" resumes.
+        """
+        return await self._request_device_server(
+            "/device-server/v1/device/work-report/page",
+            Response[WorkReportPage],
+            "work report page",
+            payload={"deviceName": device_name, "pageNumber": page_number, "pageSize": page_size},
+        )
+
+    @refresh_token_decorator
+    async def request_fpv_control_token(self, iot_id: str) -> Response[FpvControl]:
+        """Ask for the remote-drive control token (``FpvDriveApiService.requestControlToken``).
+
+        Classify the answer with :func:`~pymammotion.http.model.fpv_control.fpv_control_outcome`.
+        """
+        return await self._request_device_server(
+            "/device-server/v1/fpv/control/token",
+            Response[FpvControl],
+            "fpv control token",
+            payload={"deviceId": iot_id},
+        )
+
+    @refresh_token_decorator
+    async def refresh_fpv_control_token(self, iot_id: str, token: str) -> Response[FpvControl]:
+        """Renew a granted control token (``FpvDriveApiService.refreshControlToken``)."""
+        return await self._request_device_server(
+            "/device-server/v1/fpv/control/refresh-token",
+            Response[FpvControl],
+            "fpv control token refresh",
+            payload={"deviceId": iot_id, "token": token},
+        )
+
+    @refresh_token_decorator
+    async def save_rain_protection_config(
+        self, device_name: str, rain_protection_mode: int, custom_delay_hours: int, *, push_to_device: bool = False
+    ) -> Response[RainProtectionConfig | bool | None]:
+        """Save the rain-protection values the device just accepted (``CommonApiService.saveRainProtectionConfig``).
+
+        The app always sends ``pushToDevice`` false, having already written the device
+        itself, and 0 hours outside Sensor mode.  Nothing in the app reads the response.
+        """
+        return await self._request_device_server(
+            "/weather-server/v1/device/rain-protection/config",
+            Response[RainProtectionConfig | bool | None],
+            "rain protection config",
+            payload={
+                "deviceName": device_name,
+                "rainProtectionMode": rain_protection_mode,
+                "customDelayHours": custom_delay_hours,
+                "pushToDevice": push_to_device,
+            },
         )
 
     @refresh_token_decorator
@@ -1051,13 +1159,19 @@ class MammotionHTTP:
             content_type = resp.headers.get("Content-Type") or ""
             body = await resp.text()
             _LOGGER.debug(
-                "stream/token response: status=%s content-type=%s body=%.500s",
+                "stream/token response: status=%s content-type=%s body=%s",
                 resp.status,
                 content_type,
-                body,
+                redact_secrets(body),
             )
             if content_type.startswith("application/json"):
                 response = response_factory(Response[StreamSubscriptionResponse], json.loads(body))
+                if response.data is not None:
+                    _LOGGER.debug(
+                        "stream/token claims: viewer %s; cameras %s",
+                        describe_agora_token(response.data.token),
+                        ", ".join(f"{c.cameraId}: {describe_agora_token(c.token)}" for c in response.data.cameras),
+                    )
                 if response.data is None:
                     _LOGGER.warning(
                         "stream/token returned JSON with no stream data (code=%s msg=%s)",

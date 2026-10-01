@@ -41,6 +41,10 @@ class CommandTimeoutError(TransportError):
         super().__init__(f"No response for '{expected_field}' after {attempts} attempt(s)")
 
 
+class CommandRejectedError(TransportError):
+    """The device answered, but refused the command (e.g. a batch set acked with ``RES_FAILURE``)."""
+
+
 class NoTransportAvailableError(TransportError):
     """No connected transport available to send the command."""
 
@@ -202,7 +206,7 @@ class Subscription:
         self.cancel()
 
 
-class EventBus(Generic[T]):
+class EventBus(Generic[T]):  # noqa: UP046
     """Type-safe event bus with RAII subscriptions.
 
     Handlers are called concurrently on emit(). An exception in one handler

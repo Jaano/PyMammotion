@@ -14,13 +14,13 @@ from mashumaro.exceptions import InvalidFieldValue, MissingField
 
 from pymammotion.account.registry import BLE_ONLY_ACCOUNT
 from pymammotion.aliyun.exceptions import DeviceOfflineException, DeviceUnboundException, TooManyRequestsException
-from pymammotion.data.model.device import MowerDevice
 from pymammotion.data.mqtt.event import DeviceProtobufMsgEventParams
 from pymammotion.data.mqtt.status import StatusType
 from pymammotion.device.ble_loop import ble_activity_loop, ble_polling_loop
 from pymammotion.device.dynamics_line_loop import dynamics_line_loop
 from pymammotion.device.modes import _DeviceMode
 from pymammotion.device.mqtt_loop import mqtt_activity_loop
+from pymammotion.device.remote_drive import RemoteDriveSession
 from pymammotion.device.state_reducer import StateReducer, get_state_reducer
 from pymammotion.mammotion.commands.mammotion_command import MammotionCommand
 from pymammotion.messaging.broker import DeviceMessageBroker
@@ -44,7 +44,6 @@ from pymammotion.transport.base import (
     TransportError,
     TransportType,
 )
-from pymammotion.transport.ble import BLETransport
 from pymammotion.transport.cloud import CloudTransport
 from pymammotion.utility.constant.device_enums import WorkMode
 from pymammotion.utility.constant.poll_policy import MOWING_ACTIVE_MODES, NO_REQUEST_MODES
@@ -79,6 +78,9 @@ _RPT_ACK_TIMEOUT: float = 5.0
 #: gets polled for data it just sent.
 _REPORT_SNAPSHOT_DEBOUNCE: float = 15.0
 
+#: Server function code the app gates remote driving (manual movement over the cloud) on.
+_REMOTE_DRIVE_FUNCTION_CODE = "002.002"
+
 #: Channels sent in one-shot (count=1) polls AND in the BLE continuous stream.
 _REPORT_CHANNELS: list[RptInfoType] = [
     RptInfoType.RIT_DEV_STA,
@@ -94,12 +96,14 @@ _REPORT_CHANNELS: list[RptInfoType] = [
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
-    from pymammotion.data.model.device import Device, MowingDevice
+    from pymammotion.data.model.device import Device, MowerDevice, MowingDevice
     from pymammotion.data.mqtt.event import ThingEventMessage
     from pymammotion.data.mqtt.properties import MammotionPropertiesMessage, ThingPropertiesMessage
     from pymammotion.data.mqtt.status import ThingStatusMessage
     from pymammotion.device.readiness import ReadinessChecker, ReadinessStatus
+    from pymammotion.device.remote_drive import DriveClock, DriveSend, FpvTokenSource
     from pymammotion.messaging.saga import Saga
+    from pymammotion.transport.ble import BLETransport
 
 _logger = logging.getLogger(__name__)
 
@@ -338,6 +342,7 @@ class DeviceHandle:
         self._last_report_data_at: float = 0.0
         #: Signalled on each such frame so waiters don't have to poll the timestamp.
         self._report_data_event: asyncio.Event = asyncio.Event()
+        self._remote_drive: RemoteDriveSession | None = None
         # Wire up critical error propagation from queue
         self.queue.on_critical_error = self._on_critical_error
 
@@ -363,8 +368,13 @@ class DeviceHandle:
         command = MammotionCommand(self.device_name, self.user_account)
         # NAV routing (get_msg_device) keys off this; without it every device falls
         # back to name-only detection.
-        command.set_device_product_key(self.product_key or self._reported_product_key())
+        command.set_device_product_key(self.resolved_product_key)
         return command
+
+    @property
+    def resolved_product_key(self) -> str:
+        """The cloud product key, else the one the device reported itself."""
+        return self.product_key or self._reported_product_key()
 
     def _reported_product_key(self) -> str:
         """Product key as the device itself reported it (``net.toapp_wifi_iot_status``).
@@ -981,16 +991,25 @@ class DeviceHandle:
         that cannot be reached.  ``mqtt_reported_offline`` blocks automatic
         sends only, and clears on the next inbound cloud frame or status push.
         """
+        already_offline = self._flag_device_offline(transport)
+        ble = self._transports.get(TransportType.BLE)
+        if ble is not None and ble.is_connected:
+            _logger.warning("Device '%s' offline via MQTT, retrying over BLE", self.device_name)
+            return ble
+        self._log_device_offline(transport, already_offline=already_offline)
+        return None
+
+    def _flag_device_offline(self, transport: Transport) -> bool:
+        """Set ``mqtt_reported_offline`` for a cloud rejection on *transport*; returns whether it was already set."""
         already_offline = self._availability.mqtt_reported_offline
         self.update_availability(
             transport.transport_type,
             self._availability.mqtt,
             mqtt_reported_offline=True,
         )
-        ble = self._transports.get(TransportType.BLE)
-        if ble is not None and ble.is_connected:
-            _logger.warning("Device '%s' offline via MQTT, retrying over BLE", self.device_name)
-            return ble
+        return already_offline
+
+    def _log_device_offline(self, transport: Transport, *, already_offline: bool) -> None:
         # A powered-off device fails every queued send, so only the transition
         # into offline is worth a warning.
         log = _logger.debug if already_offline else _logger.warning
@@ -999,7 +1018,6 @@ class DeviceHandle:
             self.device_name,
             transport.transport_type.value,
         )
-        return None
 
     async def _on_device_unbound(self, transport: Transport) -> Transport | None:
         """Handle a cloud "device is unbound" (Aliyun 29004) during a send.
@@ -1160,6 +1178,40 @@ class DeviceHandle:
             if new_val != last[0]:
                 last[0] = new_val
                 await handler(new_val)
+
+        return self._state_changed_bus.subscribe(_on_state)
+
+    def watch_until_handled(
+        self,
+        getter: Callable[[DeviceSnapshot], _T],
+        handler: Callable[[_T], Awaitable[bool]],
+    ) -> Subscription:
+        """Offer a changed value to *handler* on every snapshot until it returns True.
+
+        Unlike :meth:`watch_field`, a value the handler refuses stays pending and is offered
+        again — the APK's ``updateTotalHash`` only records a ``path_hash`` once its gate is open.
+        A handler that raises counts as having acted, so a failing one is not retried per report.
+        """
+        handled: list[object] = [self._UNSET]
+        in_flight = False
+
+        async def _on_state(snapshot: DeviceSnapshot) -> None:
+            nonlocal in_flight
+            new_val = getter(snapshot)
+            if handled[0] is self._UNSET:
+                handled[0] = new_val
+                return
+            if new_val == handled[0] or in_flight:
+                return
+            in_flight = True
+            try:
+                if await handler(new_val):
+                    handled[0] = new_val
+            except Exception:
+                handled[0] = new_val
+                raise
+            finally:
+                in_flight = False
 
         return self._state_changed_bus.subscribe(_on_state)
 
@@ -1361,6 +1413,9 @@ class DeviceHandle:
 
     async def stop(self) -> None:
         """Stop the command queue, broker, debounce task, and disconnect all transports."""
+        if self._remote_drive is not None:
+            # Stop the mower and release its control token while the cloud transport is still wired.
+            await self._remote_drive.stop()
         self._stopping = True
         self._started = False
         if self._report_stream_timer is not None:
@@ -1748,18 +1803,46 @@ class DeviceHandle:
 
         await self.queue.enqueue(_send, priority=Priority.BACKGROUND, skip_if_saga_active=True)
 
+    def _one_shot_report_command(self) -> bytes:
+        """Build the count=1 ``RPT_START`` shared by :meth:`send_one_shot_report` and :meth:`refresh_status`."""
+        return self.commands.request_iot_sys(
+            rpt_act=RptAct.RPT_START,
+            rpt_info_type=_REPORT_CHANNELS,
+            timeout=10_000,
+            count=1,
+        )
+
+    async def refresh_status(self, send: Callable[[bytes], Awaitable[None]] | None = None) -> None:
+        """Send a one-shot report request now, on the caller's task, for a person waiting on it.
+
+        The user-initiated counterpart of :meth:`send_one_shot_report`: no debounce, no
+        queue, and the send is user-initiated, so the cloud's advisory offline flag does not
+        refuse it.  *send* defaults to a user-initiated :meth:`send_raw`;
+        ``MammotionClient.refresh_status`` passes one wrapped in its auth retry.
+
+        A live BLE continuous stream is left alone: its flag is set only on a verified
+        report and cleared by the BLE loop's stale watchdog, so it is already delivering
+        fresher data, and a count=1 ``RPT_START`` would reconfigure the subscription that
+        loop is renewing.
+
+        Raises whatever the send raises — ``NoTransportAvailableError``,
+        ``DeviceOfflineException`` and the rest — so the caller learns it did not land.
+        """
+        if self._ble_stream_active:
+            return
+
+        async def _user_send(payload: bytes) -> None:
+            await self.send_raw(payload, user_initiated=True)
+
+        await self._send_rpt_start_verified(self._one_shot_report_command(), send or _user_send)
+
     async def send_one_shot_report(self) -> None:
         """Enqueue a one-shot ``request_iot_sys(count=1)`` data refresh.
 
         Routes via the best available transport — BLE if connected and preferred,
         MQTT otherwise — matching the same transport-priority rules as user commands.
         """
-        cmd_bytes = self.commands.request_iot_sys(
-            rpt_act=RptAct.RPT_START,
-            rpt_info_type=_REPORT_CHANNELS,
-            timeout=10_000,
-            count=1,
-        )
+        cmd_bytes = self._one_shot_report_command()
 
         async def _send() -> None:
             await self._send_rpt_start_verified(cmd_bytes, self.send_raw)
@@ -2105,6 +2188,59 @@ class DeviceHandle:
             )
             await self._send_marked(mqtt, payload, user_initiated=user_initiated)
 
+    def usable_cloud_transport(self, *, user_initiated: bool = False) -> Transport:
+        """Return the cloud transport a cloud-only send would use, gated like :meth:`active_transport`.
+
+        Raises:
+            NoTransportAvailableError: no cloud transport is registered, or it is unusable
+                (terminal auth failure, or reported offline for a background send).
+
+        """
+        mqtt = self._pick_cloud_transport()
+        if mqtt is None or not self._cloud_transport_usable(mqtt, user_initiated=user_initiated):
+            msg = f"No usable cloud transport for device '{self.device_id}'"
+            raise NoTransportAvailableError(msg)
+        return mqtt
+
+    async def send_cloud(self, payload: bytes, *, user_initiated: bool = False) -> None:
+        """Send *payload* over the cloud only — never BLE, with no fallback either way.
+
+        For traffic the device accepts only over IoT: the remote-drive session frames
+        (``sendOrderMsg_DriverIotOnly`` in the app).  A connected BLE link does not win here.
+        """
+        transport = self.usable_cloud_transport(user_initiated=user_initiated)
+        try:
+            await self._send_marked(transport, payload, user_initiated=user_initiated)
+        except TooManyRequestsException:
+            if isinstance(transport, CloudTransport):
+                transport.set_rate_limited()
+            raise
+        except DeviceOfflineException:
+            self._log_device_offline(transport, already_offline=self._flag_device_offline(transport))
+            raise
+
+    @property
+    def remote_drive(self) -> RemoteDriveSession | None:
+        """Return the device's cloud remote-drive session, once one has been created."""
+        return self._remote_drive
+
+    def ensure_remote_drive(
+        self,
+        *,
+        tokens: FpvTokenSource,
+        send: DriveSend,
+        clock: DriveClock | None = None,
+    ) -> RemoteDriveSession:
+        """Return this device's remote-drive session, creating it on first use.
+
+        The handle owns the session so :meth:`stop` can halt the mower and release its
+        control token; the client supplies *tokens* and *send* because the account's HTTP
+        login and auth-retry live there.
+        """
+        if self._remote_drive is None:
+            self._remote_drive = RemoteDriveSession(self, tokens=tokens, send=send, clock=clock)
+        return self._remote_drive
+
     # ------------------------------------------------------------------
     # Error bus
     # ------------------------------------------------------------------
@@ -2192,6 +2328,22 @@ class DeviceHandle:
     def ble_heartbeat_failures(self, value: int) -> None:
         """Setter so the BLE loop can update the counter without reaching into ``_ble_heartbeat_failures`` directly."""
         self._ble_heartbeat_failures = value
+
+    def supports_wifi_movement(self) -> bool:
+        """Whether the mower accepts manual movement over the cloud, from its live state.
+
+        A model in the release note's family tables follows its firmware threshold
+        (:meth:`DeviceType.supports_wifi_movement`); any other mower needs the server's
+        function list, fetched for its current firmware, to include ``002.002`` — the
+        app's own gate.  Non-mowers never qualify.
+        """
+        product_key = self.resolved_product_key
+        device = self.snapshot.raw
+        if DeviceType.has_wifi_movement_threshold(self.device_name, product_key):
+            return DeviceType.supports_wifi_movement(self.device_name, device.main_firmware_version, product_key)
+        if self._is_rtk or self._is_swimming_pool:
+            return False
+        return device.supports_function_code(_REMOTE_DRIVE_FUNCTION_CODE)
 
     @property
     def has_usable_transport(self) -> bool:

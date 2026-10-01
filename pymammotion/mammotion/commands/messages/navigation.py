@@ -5,7 +5,9 @@ import logging
 import time
 
 from pymammotion.data.model import GenerateRouteInformation
-from pymammotion.data.model.hash_list import Plan, SvgMessage
+from pymammotion.data.model.device_info import RECHARGE_LEVEL_RANGE, RESUME_LEVEL_RANGE, SMART_CHARGE_LEVEL
+from pymammotion.data.model.generate_route_information import ADVANCED_TASK_SETTINGS
+from pymammotion.data.model.hash_list import Plan, SvgMessage, encode_auto_change_direction
 from pymammotion.data.model.region_data import RegionData
 from pymammotion.mammotion.commands.abstract_message import AbstractMessage
 from pymammotion.proto import (
@@ -32,10 +34,20 @@ from pymammotion.proto import (
     SvgMessageT,
     VisionCtrlMsg,
     WorkReportCmdData,
+    WorkReportStartWorkingMsg,
     WorkReportUpdateCmd,
 )
+from pymammotion.utility.device_type import DeviceType
 
 logger = logging.getLogger(__name__)
+
+
+def _checked_charge_level(level: int, allowed: range) -> int:
+    """Return *level* if the app could send it, else raise ``ValueError``."""
+    if level != SMART_CHARGE_LEVEL and level not in allowed:
+        msg = f"charge level {level} is neither smart ({SMART_CHARGE_LEVEL}) nor {allowed.start}-{allowed.stop - 1}"
+        raise ValueError(msg)
+    return level
 
 
 class MessageNavigation(AbstractMessage, ABC):
@@ -162,48 +174,15 @@ class MessageNavigation(AbstractMessage, ABC):
         logger.debug("Sync data ==================== Sending ============ Restore command")
         return self.send_order_msg_nav(build)
 
-    def send_plan(self, plan_bean: Plan) -> bytes:
-        """Send a mowing plan job configuration to the device."""
-        build = MctlNav(
-            todev_planjob_set=NavPlanJobSet(
-                pver=plan_bean.pver,
-                sub_cmd=plan_bean.sub_cmd,
-                area=plan_bean.area,
-                work_time=plan_bean.work_time,
-                version=plan_bean.version,
-                id=plan_bean.id,
-                user_id=plan_bean.user_id,
-                device_id=plan_bean.device_id,
-                plan_id=plan_bean.plan_id,
-                task_id=plan_bean.task_id,
-                job_id=plan_bean.job_id,
-                start_time=plan_bean.start_time,
-                end_time=plan_bean.end_time,
-                week=plan_bean.week,
-                knife_height=plan_bean.knife_height,
-                model=plan_bean.model,
-                edge_mode=plan_bean.edge_mode,
-                required_time=plan_bean.required_time,
-                route_angle=plan_bean.route_angle,
-                route_model=plan_bean.route_model,
-                route_spacing=plan_bean.route_spacing,
-                ultrasonic_barrier=plan_bean.ultrasonic_barrier,
-                total_plan_num=plan_bean.total_plan_num,
-                plan_index=plan_bean.plan_index,
-                result=plan_bean.result,
-                speed=plan_bean.speed,
-                task_name=plan_bean.task_name,
-                job_name=plan_bean.job_name,
-                zone_hashs=plan_bean.zone_hashs,
-                reserved=plan_bean.reserved_for_send(),
-            )
-        )
-        logger.debug(f"Send read job plan command planBean={plan_bean}")
-        return self.send_order_msg_nav(build)
-
     def send_schedule(self, plan_bean: Plan) -> bytes:
         """Send a scheduled mowing plan (including recurrence fields) to the device."""
-        build = NavPlanJobSet(
+        logger.debug(f"Send job plan command planBean={plan_bean}")
+        return self.send_order_msg_nav(MctlNav(todev_planjob_set=self._plan_job_set(plan_bean)))
+
+    def _plan_job_set(self, plan_bean: Plan) -> NavPlanJobSet:
+        """Build the full ``NavPlanJobSet`` for *plan_bean*, as ``MACommandApiHelper.sendSchedule`` does."""
+        device_name, product_key = self.get_device_name(), self.get_device_product_key()
+        return NavPlanJobSet(
             pver=plan_bean.pver,
             sub_cmd=plan_bean.sub_cmd,
             area=plan_bean.area,
@@ -217,7 +196,7 @@ class MessageNavigation(AbstractMessage, ABC):
             job_id=plan_bean.job_id,
             start_time=plan_bean.start_time,
             end_time=plan_bean.end_time,
-            week=plan_bean.week,
+            week=plan_bean.week_for_send(device_name, product_key),
             knife_height=plan_bean.knife_height,
             model=plan_bean.model,
             edge_mode=plan_bean.edge_mode,
@@ -233,16 +212,18 @@ class MessageNavigation(AbstractMessage, ABC):
             task_name=plan_bean.task_name,
             job_name=plan_bean.job_name,
             zone_hashs=plan_bean.zone_hashs,
-            reserved=plan_bean.reserved_for_send(),
+            reserved=plan_bean.reserved_for_send(device_name, product_key),
             weeks=plan_bean.weeks,
             start_date=plan_bean.start_date,
             trigger_type=plan_bean.trigger_type,
             day=plan_bean.day,
             toward_included_angle=plan_bean.toward_included_angle,
             toward_mode=plan_bean.toward_mode,
+            ride_boundary_distance=DeviceType.ride_boundary_distance_to_send(
+                device_name, plan_bean.edge_mode, plan_bean.ride_boundary_distance, product_key
+            ),
+            auto_change_direction=encode_auto_change_direction(plan_bean.auto_change_direction),
         )
-        logger.debug(f"Send read job plan command planBean={plan_bean}")
-        return self.send_order_msg_nav(MctlNav(todev_planjob_set=build))
 
     def single_schedule(self, plan_id: str) -> bytes:
         """Execute a single-run schedule task identified by plan_id."""
@@ -375,6 +356,19 @@ class MessageNavigation(AbstractMessage, ABC):
     def request_job_history(self, num: int) -> bytes:
         """Fetch up to num historical mowing job records from the device."""
         return self.send_order_msg_nav(MctlNav(todev_work_report_cmd=WorkReportCmdData(sub_cmd=1, get_info_num=num)))
+
+    def continue_last_job(self, work_id: int) -> bytes:
+        """Resume the interrupted job ``work_id``, the ``workId`` of the cloud's latest work report.
+
+        The device echoes the message back with ``result`` set.
+        """
+        build = MctlNav(
+            todev_work_report_start_working_msg=WorkReportStartWorkingMsg(
+                account_id=self.user_account, work_id=work_id, stamp=round(time.time() * 1000), result=1
+            )
+        )
+        logger.debug(f"Send command - continue last job work_id={work_id}")
+        return self.send_order_msg_nav(build)
 
     def leave_dock(self) -> bytes:
         """Send one-touch command to automatically undock the mower from the charging station."""
@@ -548,7 +542,9 @@ class MessageNavigation(AbstractMessage, ABC):
             toward_included_angle=int(generate_route_information.toward_included_angle),  # luba 2 yuka only
             toward_mode=int(generate_route_information.toward_mode),  # luba 2 yuka only
             reserved=generate_route_information.path_order,
-            auto_change_direction=int(generate_route_information.auto_change_direction),
+            task_settings_mode=ADVANCED_TASK_SETTINGS,
+            auto_change_direction=encode_auto_change_direction(generate_route_information.auto_change_direction),
+            ride_boundary_distance=float(generate_route_information.ride_boundary_distance),
         )
         logger.debug(f"{self.get_device_name()}Generate route====={build}")
         logger.debug(f"Send command--Generate route information generateRouteInformation={generate_route_information}")
@@ -568,9 +564,12 @@ class MessageNavigation(AbstractMessage, ABC):
             ultra_wave=int(generate_route_information.ultra_wave),
             channel_width=int(generate_route_information.channel_width),
             channel_mode=int(generate_route_information.channel_mode),
-            toward=int(generate_route_information.toward),
+            # The app's modify builder zeroes toward when toward_mode is 0; its plan builder does not.
+            toward=int(generate_route_information.toward) if generate_route_information.toward_mode != 0 else 0,
             reserved=generate_route_information.path_order,
-            auto_change_direction=int(generate_route_information.auto_change_direction),
+            task_settings_mode=ADVANCED_TASK_SETTINGS,
+            auto_change_direction=encode_auto_change_direction(generate_route_information.auto_change_direction),
+            ride_boundary_distance=float(generate_route_information.ride_boundary_distance),
         )
         logger.debug(f"{self.get_device_name()} Generate route ===== {build}")
         logger.debug(f"Send command -- Modify route parameters generate_route_information={generate_route_information}")
@@ -832,7 +831,7 @@ class MessageNavigation(AbstractMessage, ABC):
 
     # === Visual safety zones (manual elements) ===
 
-    def add_manual_element(
+    def add_manual_element(  # noqa: PLR0917
         self,
         shape: int,
         type: int,
@@ -877,7 +876,7 @@ class MessageNavigation(AbstractMessage, ABC):
 
     # === Edgewise mapping response ===
 
-    def response_edgewise_mapping(
+    def response_edgewise_mapping(  # noqa: PLR0917
         self, action: int, hash_num: int, result: int, type: int, total_frame: int, current_frame: int
     ) -> bytes:
         """Acknowledge edgewise mapping data received from device."""
@@ -980,6 +979,28 @@ class MessageNavigation(AbstractMessage, ABC):
         """Write the animal-avoidance setting; ``context`` carries the value to apply."""
         build = MctlNav(nav_sys_param_cmd=NavSysParamMsg(id=12, context=context, rw=1))
         logger.debug(f"Send command - Set animal avoidance context={context}")
+        return self.send_order_msg_nav(build)
+
+    def read_recharge_level(self) -> bytes:
+        """Read the battery level the mower returns to charge at (id 14)."""
+        return self._charge_level_param(14, 0, 0)
+
+    def set_recharge_level(self, level: int) -> bytes:
+        """Set the return-to-charge level: a percent in ``RECHARGE_LEVEL_RANGE`` or ``SMART_CHARGE_LEVEL``."""
+        return self._charge_level_param(14, _checked_charge_level(level, RECHARGE_LEVEL_RANGE), 1)
+
+    def read_resume_level(self) -> bytes:
+        """Read the battery level the mower resumes mowing at (id 15)."""
+        return self._charge_level_param(15, 0, 0)
+
+    def set_resume_level(self, level: int) -> bytes:
+        """Set the resume-mowing level: a percent in ``RESUME_LEVEL_RANGE`` or ``SMART_CHARGE_LEVEL``."""
+        return self._charge_level_param(15, _checked_charge_level(level, RESUME_LEVEL_RANGE), 1)
+
+    def _charge_level_param(self, param_id: int, context: int, rw: int) -> bytes:
+        # The app sends ids 14/15 on nav_sys_param_cmd on every device (setRechargeAndContinueWorking).
+        build = MctlNav(nav_sys_param_cmd=NavSysParamMsg(id=param_id, context=context, rw=rw))
+        logger.debug(f"Send command - charge level id={param_id} context={context} rw={rw}")
         return self.send_order_msg_nav(build)
 
     # === Radar test ===

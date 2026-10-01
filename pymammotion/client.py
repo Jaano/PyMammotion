@@ -56,6 +56,7 @@ from pymammotion.aliyun.model.dev_by_account_response import Device
 from pymammotion.client_auth import _AUTH_REJECTED, CloudAuthMixin
 from pymammotion.data.model import GenerateRouteInformation
 from pymammotion.data.model.device import MowerDevice, MowingDevice, RTKBaseStationDevice, create_device
+from pymammotion.data.model.function_codes import FunctionCodes
 from pymammotion.data.model.generate_geojson import (
     apply_area_geojson,
     apply_device_mow_progress_geojson,
@@ -63,14 +64,17 @@ from pymammotion.data.model.generate_geojson import (
     apply_mowing_geojson,
 )
 from pymammotion.data.model.hash_list import PathType, SvgMessage
+from pymammotion.data.model.mowing_modes import RainProtectionMode
 from pymammotion.data.model.svg import chunk_svg_messages
 from pymammotion.device.auto_fetch import AutoFetchWatchers, _should_fetch_mow_path
 from pymammotion.device.ble_inventory import BleInventory
 from pymammotion.device.handle import DeviceHandle, DeviceRegistry
 from pymammotion.device.inbound_router import InboundRouter
 from pymammotion.device.readiness import get_readiness_checker
+from pymammotion.device.remote_drive import HttpTokenSource
 from pymammotion.device.state_reducer import apply_rtk_coordinate
-from pymammotion.http.model.http import CheckDeviceVersion, DeviceRecord, MQTTConnection
+from pymammotion.http.model.http import CheckDeviceVersion, DeviceRecord, MQTTConnection, UnauthorizedExceptionError
+from pymammotion.http.model.rain_protection import WeatherServerSync
 from pymammotion.messaging.command_queue import Priority, execute_command
 from pymammotion.messaging.common_data_saga import CommonDataSaga
 from pymammotion.messaging.edge_saga import EdgeMappingSaga
@@ -79,10 +83,12 @@ from pymammotion.messaging.mow_path_saga import MowPathSaga
 from pymammotion.messaging.plan_saga import PlanFetchSaga
 from pymammotion.messaging.spino_plan_saga import SpinoPlanFetchSaga
 from pymammotion.messaging.svg_saga import SvgSendSaga
-from pymammotion.proto import RptAct, RptInfoType
+from pymammotion.proto import BatchConfigType, ResResult, RptAct, RptInfoType
 from pymammotion.transport.aliyun_mqtt import AliyunMQTTConfig, AliyunMQTTTransport
 from pymammotion.transport.base import (
     AuthError,
+    CommandRejectedError,
+    CommandTimeoutError,
     NoTransportAvailableError,
     ReLoginRequiredError,
     SessionExpiredError,
@@ -109,6 +115,11 @@ _CONTINUOUS_STREAM_CHANNELS: list[RptInfoType] = [
 #: immediate).  The cloud-side migration after a firmware update can take minutes.
 _UNBOUND_MIGRATION_DELAYS: tuple[float, ...] = (0.0, 30.0, 60.0, 120.0, 180.0)
 
+#: Per-attempt reply wait for a batch-config exchange; the app's rain-protection module gives up after 8 s.
+_BATCH_CONFIG_TIMEOUT = 5.0
+#: Every batch config type answers on the same two fields, so their exchanges share one broker lock.
+_BATCH_CONFIG_EXCHANGE = "batch_config"
+
 _ONE_SHOT_CHANNELS: list[RptInfoType] = [
     RptInfoType.RIT_DEV_STA,
     RptInfoType.RIT_DEV_LOCAL,
@@ -130,10 +141,13 @@ if TYPE_CHECKING:
 
     from pymammotion.auth.token_manager import MQTTCredentials, TokenManager
     from pymammotion.data.model.device import Device as DeviceModel
+    from pymammotion.data.model.device_info import RainProtectionSettings
     from pymammotion.data.mqtt.event import ThingEventMessage
     from pymammotion.data.mqtt.properties import ThingPropertiesMessage
     from pymammotion.data.mqtt.status import ThingStatusMessage
+    from pymammotion.device.remote_drive import RemoteDriveEvent, RemoteDriveSession
     from pymammotion.http.http import MammotionHTTP
+    from pymammotion.http.model.work_report import WorkReportRecord
     from pymammotion.transport.base import Transport
     from pymammotion.transport.ble import BLETransport
 
@@ -177,6 +191,8 @@ class MammotionClient(CloudAuthMixin):
             start_map_sync=self.start_map_sync,
             start_plan_sync=self.start_plan_sync,
             start_mow_path_saga=self.start_mow_path_saga,
+            refresh_function_codes=self.refresh_function_codes,
+            function_codes_ready=lambda handle: self._function_codes_http(handle) is not None,
         )
         self._ha_version: str | None = ha_version
         #: Fired when all automatic auth recovery attempts (relogin, token refresh,
@@ -365,6 +381,42 @@ class MammotionClient(CloudAuthMixin):
         if time.monotonic() - handle.last_report_at > max_age_s:
             await handle.request_report_snapshot()
 
+    async def refresh_status(self, device_name: str, account_id: str | None = None) -> None:
+        """Request a status report now, for a person who asked for one.
+
+        The user-initiated counterpart of :meth:`ensure_fresh_state`: no age check, no
+        debounce and no queue.  Dispatched on the caller's task with ``Priority.USER``
+        semantics, so the cloud's advisory offline flag does not refuse it and a running
+        saga does not hold it.  Returns once the device answered with a report or the
+        RPT_START verification window ran out.  A no-op while a BLE continuous stream is
+        live (see :meth:`DeviceHandle.refresh_status`).
+
+        Raises:
+            KeyError: *device_name* is not registered.
+            NoTransportAvailableError: nothing can carry it, including a terminally failed
+                cloud transport.
+            DeviceOfflineException: the cloud rejected it because the device is offline.
+            Exception: anything else a direct send propagates (see
+                :meth:`send_command_with_args`).
+
+        """
+        handle = self._device_registry.get_by_name(device_name, account_id)
+        if handle is None:
+            msg = f"Device '{device_name}' not registered"
+            raise KeyError(msg)
+        handle.record_user_command()
+        session = self._get_session_for_handle(handle)
+
+        async def _send(payload: bytes) -> None:
+            await self._send_with_auth_retry(lambda: handle.send_raw(payload, user_initiated=True), session)
+
+        await execute_command(
+            lambda: handle.refresh_status(_send),
+            device_name=device_name,
+            on_critical_error=handle.queue.on_critical_error,
+            reraise=True,
+        )
+
     def subscribe_device_status(
         self,
         device_name: str,
@@ -493,7 +545,11 @@ class MammotionClient(CloudAuthMixin):
                 await handle.notify_critical_error(exc)
 
     async def _send_with_auth_retry(
-        self, send_fn: Callable[[], Awaitable[None]], session: AccountSession | None = None
+        self,
+        send_fn: Callable[[], Awaitable[None]],
+        session: AccountSession | None = None,
+        *,
+        swallow_transport_errors: bool = True,
     ) -> None:
         """Call *send_fn*; on an auth failure refresh that transport's credentials once and retry.
 
@@ -505,6 +561,9 @@ class MammotionClient(CloudAuthMixin):
         reaches the host, which prompts the user to re-authenticate.  Nothing here
         re-logins with a stored password — that would bypass the prompt and, during a
         server-side outage, fire a password grant per queued command.
+
+        Other transport errors are logged and dropped unless *swallow_transport_errors*
+        is False — a remote-drive frame must not look delivered when it was refused.
         """
         try:
             await send_fn()
@@ -520,6 +579,8 @@ class MammotionClient(CloudAuthMixin):
             # swallowed into a log line and the host would never prompt for re-auth.
             raise
         except TransportError as ex:
+            if not swallow_transport_errors:
+                raise
             _logger.warning(ex)
 
     # ------------------------------------------------------------------
@@ -675,6 +736,53 @@ class MammotionClient(CloudAuthMixin):
         except Exception:
             _logger.warning("fetch_rtk_properties: failed for %s", device_name, exc_info=True)
 
+    async def refresh_function_codes(
+        self, device_name: str, *, force: bool = False, account_id: str | None = None
+    ) -> bool:
+        """Fetch the cloud's function set for the device's product key and firmware, and store it.
+
+        Mirrors the app's ``FunctionsConfigRepository``: the set is cached per
+        ``(productKey, productVersion)`` with no expiry, so nothing is requested while the
+        stored set matches unless *force* is given.  Returns True when a set was stored.
+        Failures are logged and leave the state alone; this path never refreshes a token.
+
+        Raises:
+            UnauthorizedExceptionError: The server rejected the access token.
+            ReLoginRequiredError: The account's login is already known to be dead.
+
+        """
+        handle = self._device_registry.get_by_name(device_name, account_id)
+        if handle is None:
+            return False
+        product_key = handle.resolved_product_key
+        firmware = handle.snapshot.raw.main_firmware_version
+        if not (product_key and firmware):
+            return False
+        if not force and handle.snapshot.raw.function_codes.is_current_for(product_key, firmware):
+            return False
+        if (http := self._function_codes_http(handle)) is None:
+            return False
+        try:
+            response = await http.get_product_version_functions(product_key, firmware)
+        except _AUTH_REJECTED:
+            raise
+        except Exception:
+            _logger.warning("refresh_function_codes: fetch failed for %s", device_name, exc_info=True)
+            return False
+        if response.code != 0 or response.data is None:
+            _logger.debug("refresh_function_codes: '%s' answered %s", device_name, response)
+            return False
+        stored = FunctionCodes(product_key=product_key, product_version=firmware, codes=response.data.codes())
+        snapshot, _ = handle.state_machine.apply(
+            dataclasses.replace(handle.snapshot.raw, function_codes=stored), handle.availability
+        )
+        await handle.emit_state_changed(snapshot)
+        return True
+
+    def _function_codes_http(self, handle: DeviceHandle) -> MammotionHTTP | None:
+        session = self._get_session_for_handle(handle) or self._get_default_session()
+        return session.mammotion_http if session is not None else None
+
     async def apply_device_properties(self, device_name: str, properties: ThingPropertiesMessage) -> None:
         """Apply a thing/properties message to the named device's state machine.
 
@@ -810,6 +918,7 @@ class MammotionClient(CloudAuthMixin):
         account_id = BLE_ONLY_ACCOUNT if acct_session is None else acct_session.account_id
         registry = self._device_registry
         handle = registry.get(account_id, device_id)
+        existing = handle
         if handle is None and cloud is not None and (orphan := registry.get(BLE_ONLY_ACCOUNT, device_id)) is not None:
             await registry.rekey(orphan, account_id)
             handle = orphan
@@ -871,6 +980,9 @@ class MammotionClient(CloudAuthMixin):
 
         if not handle.is_started:
             await handle.start()
+        if cloud is not None and not created and existing is None:
+            # Adopted onto the account: re-offer the snapshot so work deferred for want of a login runs now.
+            await handle.emit_state_changed(handle.snapshot)
         return handle
 
     async def _detach_cloud_from_account(self, session: AccountSession, *, rekey: bool) -> None:
@@ -1754,6 +1866,10 @@ class MammotionClient(CloudAuthMixin):
         if device.map.is_mow_path_current(path_hash):
             apply_device_mow_progress_geojson(device)
             return False
+        # Only a live route hash can contradict the stored one: an idle device reports 1, which
+        # never matches and would blank the cached path on every poll.
+        if path_hash > 1:
+            device.map.invalidate_stale_route(path_hash)
         if not _should_fetch_mow_path(device, handle, path_hash):
             return False
         # The reducer folds the reply into `device.work`, which the route info is built from.
@@ -2023,6 +2139,252 @@ class MammotionClient(CloudAuthMixin):
             return False
         handle.record_user_command()
         return True
+
+    async def get_latest_work_report(self, device_name: str, account_id: str | None = None) -> WorkReportRecord | None:
+        """Return the device's newest job-history record, the one "continue last job" resumes.
+
+        A cloud HTTP call (``device-server/v1/device/work-report/page``) made on demand;
+        nothing polls it.  ``record.can_resume`` is the app's resume-button rule and
+        ``record.resume_work_id`` the id ``continue_last_job`` takes.
+
+        Returns ``None`` when the device has no owning cloud account, no jobs, or the
+        server answers with an error code.
+
+        Raises:
+            UnauthorizedExceptionError: The token was still rejected after one refresh.
+            ReLoginRequiredError: The account's login is dead; re-authentication is required.
+            Transient network errors propagate as-is, so they never read as "no jobs".
+
+        """
+        handle = self.mower(device_name, account_id)
+        session = self._get_session_for_handle(handle) if handle is not None else None
+        if handle is None or session is None or (http := session.mammotion_http) is None:
+            return None
+        sent_with_token = http.login_info.access_token if http.login_info is not None else None
+        try:
+            response = await http.get_work_report_page(handle.device_name)
+        except UnauthorizedExceptionError:
+            if session.token_manager is None:
+                raise
+            await session.token_manager.refresh_invoke_token(stale_token=sent_with_token)
+            response = await http.get_work_report_page(handle.device_name)
+        if response.code != 0 or response.data is None:
+            _logger.warning("get_latest_work_report: '%s' failed: %s", device_name, response)
+            return None
+        return response.data.records[0] if response.data.records else None
+
+    async def read_rain_protection(
+        self, device_name: str, *, priority: Priority = Priority.NORMAL, account_id: str | None = None
+    ) -> RainProtectionSettings:
+        """Query the device's rain-protection config and return the settings the reply left in its state.
+
+        No report carries the mode or delay, so this is the only way to read them, and
+        also the probe for support: an answer with a RAINPRO entry sets ``supported``.
+        Batch-config exchanges are serialized per device (every type shares the reply
+        field), so a concurrent read or write waits its turn.
+
+        Raises:
+            KeyError: *device_name* is not registered.
+            CommandTimeoutError: The device did not answer; support is still unknown.
+
+        """
+        handle = self._device_registry.get_by_name(device_name, account_id)
+        if handle is None:
+            msg = f"Device '{device_name}' not registered"
+            raise KeyError(msg)
+        async with handle.broker.exclusive(_BATCH_CONFIG_EXCHANGE):
+            await self.send_command_and_wait(
+                device_name,
+                "get_rain_protection",
+                "batch_query_resp",
+                send_timeout=_BATCH_CONFIG_TIMEOUT,
+                priority=priority,
+                account_id=account_id,
+            )
+        return cast("MowingDevice", handle.snapshot.raw).mower_state.rain_protection
+
+    async def set_rain_protection(
+        self,
+        device_name: str,
+        mode: RainProtectionMode,
+        delay_hours: int | None = None,
+        *,
+        account_id: str | None = None,
+    ) -> WeatherServerSync:
+        """Set rain protection the way the app does: device, then the weather server, then a re-read.
+
+        A user command (``Priority.USER``: sent now, past the cloud's advisory offline
+        flag).  *delay_hours* only matters in Sensor mode; ``None`` resends the last
+        Sensor delay (``RainProtectionSettings.delay_hours``), as the app does when Sensor
+        is picked again.  The ack carries no values, so the ones sent are applied once it
+        reports success.  The weather-server copy is best effort: a failure is logged and
+        returned as ``FAILED``, never undoing the device, and a BLE-only device has none.
+
+        Raises:
+            KeyError: *device_name* is not registered.
+            ValueError: *mode* or *delay_hours* is not one the app offers; nothing is sent.
+            CommandRejectedError: The device refused the write; nothing changed.
+            CommandTimeoutError: The device did not acknowledge the write.
+            UnauthorizedExceptionError: The weather server still rejected the token after one refresh.
+            ReLoginRequiredError: The account's login is dead.
+
+        """
+        handle = self._device_registry.get_by_name(device_name, account_id)
+        if handle is None:
+            msg = f"Device '{device_name}' not registered"
+            raise KeyError(msg)
+        mode = RainProtectionMode(mode)
+        if delay_hours is None:
+            delay_hours = cast("MowingDevice", handle.snapshot.raw).mower_state.rain_protection.delay_hours
+        async with handle.broker.exclusive(_BATCH_CONFIG_EXCHANGE):
+            reply = await self.send_command_and_wait(
+                device_name,
+                "set_rain_protection",
+                "batch_set_resp",
+                send_timeout=_BATCH_CONFIG_TIMEOUT,
+                priority=Priority.USER,
+                account_id=account_id,
+                mode=mode,
+                delay_hours=delay_hours,
+            )
+        if not any(
+            result.type == BatchConfigType.CFG_TYPE_RAINPRO_CFG and result.res_result == ResResult.RES_SUCCESS
+            for result in reply.sys.batch_set_resp.res_data
+        ):
+            msg = f"{device_name} refused rain protection {mode.name}: {reply.sys.batch_set_resp.res_data}"
+            raise CommandRejectedError(msg)
+        device = cast("MowingDevice", handle.snapshot.raw)
+        applied = device.mower_state.rain_protection.with_mode(mode, delay_hours)
+        snapshot, _ = handle.state_machine.apply(
+            dataclasses.replace(device, mower_state=dataclasses.replace(device.mower_state, rain_protection=applied)),
+            handle.availability,
+        )
+        await handle.emit_state_changed(snapshot)
+        sync = await self._save_rain_protection_config(
+            handle, mode, delay_hours if mode is RainProtectionMode.sensor else 0
+        )
+        try:
+            await self.read_rain_protection(device_name, priority=Priority.USER, account_id=account_id)
+        except CommandTimeoutError:
+            _logger.debug("set_rain_protection: '%s' did not answer the re-read; keeping the values sent", device_name)
+        return sync
+
+    async def _save_rain_protection_config(
+        self, handle: DeviceHandle, mode: RainProtectionMode, delay_hours: int
+    ) -> WeatherServerSync:
+        session = self._get_session_for_handle(handle)
+        if session is None or (http := session.mammotion_http) is None:
+            _logger.debug(
+                "set_rain_protection: '%s' has no cloud login; skipping the weather server", handle.device_name
+            )
+            return WeatherServerSync.SKIPPED
+        sent_with_token = http.login_info.access_token if http.login_info is not None else None
+        try:
+            try:
+                response = await http.save_rain_protection_config(handle.device_name, mode.value, delay_hours)
+            except UnauthorizedExceptionError:
+                if session.token_manager is None:
+                    raise
+                await session.token_manager.refresh_invoke_token(stale_token=sent_with_token)
+                response = await http.save_rain_protection_config(handle.device_name, mode.value, delay_hours)
+        except _AUTH_REJECTED:
+            raise
+        except Exception:
+            _logger.warning(
+                "set_rain_protection: '%s' was set but the weather server was not updated",
+                handle.device_name,
+                exc_info=True,
+            )
+            return WeatherServerSync.FAILED
+        if response.code != 0:
+            _logger.warning(
+                "set_rain_protection: '%s' was set but the weather server refused it: %s", handle.device_name, response
+            )
+            return WeatherServerSync.FAILED
+        return WeatherServerSync.SAVED
+
+    def remote_drive_session(self, device_name: str, account_id: str | None = None) -> RemoteDriveSession:
+        """Return the device's cloud remote-drive session, creating it on first use.
+
+        Create it (or call :meth:`subscribe_remote_drive`) before starting, so a token refusal
+        during :meth:`start_remote_drive` reaches the subscriber.  The handle owns the session.
+
+        Raises:
+            KeyError: *device_name* is not registered.
+
+        """
+        if (handle := self.mower(device_name, account_id)) is None:
+            msg = f"Device '{device_name}' not registered"
+            raise KeyError(msg)
+        return handle.ensure_remote_drive(
+            tokens=HttpTokenSource(partial(self._remote_drive_http, handle), handle.iot_id),
+            send=partial(self._send_remote_drive_frame, handle),
+        )
+
+    def _remote_drive_http(self, handle: DeviceHandle) -> MammotionHTTP | None:
+        # Looked up per call: the handle's account can change on re-key or re-login.
+        session = self._get_session_for_handle(handle)
+        return session.mammotion_http if session is not None else None
+
+    async def _send_remote_drive_frame(self, handle: DeviceHandle, payload: bytes, *, timeout: float) -> None:
+        # The timeout bounds each attempt, never the refresh between them (see DriveSend).
+        async def _attempt() -> None:
+            async with asyncio.timeout(timeout):
+                await handle.send_cloud(payload, user_initiated=True)
+
+        await self._send_with_auth_retry(_attempt, self._get_session_for_handle(handle), swallow_transport_errors=False)
+
+    async def start_remote_drive(
+        self, device_name: str, account_id: str | None = None, *, require_video: bool = False
+    ) -> bool:
+        """Request the control token and enter the safety notice; see :meth:`RemoteDriveSession.start`.
+
+        *require_video* applies the app's rule that nothing is driven before the host's video
+        has a frame; report it with :meth:`set_remote_drive_video_ready`.  Returns False when
+        the server refused the token.
+
+        Raises:
+            KeyError: *device_name* is not registered.
+            NoTransportAvailableError: no usable cloud transport (a BLE-only device drives with
+                ``send_movement`` instead).
+            RemoteDriveError: already running, or video required and not ready.
+            UnauthorizedExceptionError: the token endpoint rejected the login.
+
+        """
+        session = self.remote_drive_session(device_name, account_id)
+        session.require_video = require_video
+        return await session.start()
+
+    async def confirm_remote_drive(self, device_name: str, account_id: str | None = None) -> None:
+        """Leave the safety notice and accept input; see :meth:`RemoteDriveSession.confirm`."""
+        await self.remote_drive_session(device_name, account_id).confirm()
+
+    async def remote_drive(self, device_name: str, linear: int, angular: int, account_id: str | None = None) -> None:
+        """Feed joystick input in wire units; ``(0, 0)`` is hands off.  See :meth:`RemoteDriveSession.drive`."""
+        await self.remote_drive_session(device_name, account_id).drive(linear, angular)
+
+    async def stop_remote_drive(self, device_name: str, account_id: str | None = None) -> None:
+        """Stop the mower and release the control token.  A no-op when no session is running."""
+        await self.remote_drive_session(device_name, account_id).stop()
+
+    def subscribe_remote_drive(
+        self,
+        device_name: str,
+        handler: Callable[[RemoteDriveEvent], Awaitable[None]],
+        account_id: str | None = None,
+    ) -> Subscription:
+        """Receive the device's remote-drive faults and exits (:class:`RemoteDriveEvent`)."""
+        return self.remote_drive_session(device_name, account_id).subscribe(handler)
+
+    async def set_remote_drive_video_ready(
+        self, device_name: str, *, ready: bool, account_id: str | None = None
+    ) -> None:
+        """Report whether the host's video has a frame; see :meth:`RemoteDriveSession.set_video_ready`."""
+        await self.remote_drive_session(device_name, account_id).set_video_ready(ready=ready)
+
+    def acknowledge_remote_drive_fence(self, device_name: str, account_id: str | None = None) -> None:
+        """Resume input after an ``APPROACH_FENCE`` stop."""
+        self.remote_drive_session(device_name, account_id).acknowledge_fence_warning()
 
     @property
     def cloud_http(self) -> MammotionHTTP | None:
