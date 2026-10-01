@@ -64,9 +64,6 @@ class GenerateRouteInformation:
     #: watching that field go to 1.  Only devices passing
     #: ``DeviceType.supports_auto_change_direction`` should set it.
     auto_change_direction: int = 0
-    #: The app's "Ride Edge" toggle. Only 0.0 (off) or 0.5 (on, metres) are
-    #: ever sent. Rides on ``NavReqCoverPath`` field 19.
-    ride_boundary_distance: float = 0.0
 
     @classmethod
     def from_current_task_settings(cls, settings: CurrentTaskSettings) -> GenerateRouteInformation:
@@ -81,8 +78,8 @@ class GenerateRouteInformation:
 
         - ``job_id``, ``job_mode``, ``edge_mode``, ``channel_width``,
           ``ultra_wave``, ``channel_mode``, ``toward``, ``speed``,
-          ``toward_mode``, ``toward_included_angle``, ``auto_change_direction``,
-          ``ride_boundary_distance`` — direct copy.
+          ``toward_mode``, ``toward_included_angle``, ``auto_change_direction`` —
+          direct copy.
         - ``job_ver`` → ``job_version``
         - ``knife_height`` → ``blade_height``
         - ``zone_hashs`` → ``one_hashs`` (copied, not aliased)
@@ -109,7 +106,6 @@ class GenerateRouteInformation:
             edge_mode=settings.edge_mode,
             obstacle_laps=decoded.obstacle_laps,
             auto_change_direction=settings.auto_change_direction,
-            ride_boundary_distance=settings.ride_boundary_distance,
         )
 
     @staticmethod
